@@ -50,12 +50,23 @@ def build_mainmenu_listing(loco_list):
             continue
         if data['loco_known']:
             list_id, video_list = loco_list.find_by_context(data['loco_contexts'][0])
-            if not list_id:
+            if list_id:
+                menu_title = video_list['displayName']
+                directory_item = _create_videolist_item(list_id, video_list, data, common_data, static_lists=True)
+                directory_item[1].addContextMenuItems(generate_context_menu_mainmenu(menu_id))
+                directory_items.append(directory_item)
+            elif data.get('label_id'):
+                menu_title = common.get_local_string(data['label_id'])
+                menu_description = (common.get_local_string(data['description_id'])
+                                    if data.get('description_id') is not None
+                                    else '')
+                list_item = ListItemW(label=menu_title)
+                list_item.setArt({'icon': data.get('icon', 'DefaultFolder.png')})
+                list_item.setInfo('video', {'Plot': menu_description})
+                list_item.addContextMenuItems(generate_context_menu_mainmenu(menu_id))
+                directory_items.append((common.build_url(data['path'], mode=G.MODE_DIRECTORY), list_item, True))
+            else:
                 continue
-            menu_title = video_list['displayName']
-            directory_item = _create_videolist_item(list_id, video_list, data, common_data, static_lists=True)
-            directory_item[1].addContextMenuItems(generate_context_menu_mainmenu(menu_id))
-            directory_items.append(directory_item)
         else:
             menu_title = common.get_local_string(data['label_id']) if data.get('label_id') else 'Missing menu title'
             menu_description = (common.get_local_string(data['description_id'])

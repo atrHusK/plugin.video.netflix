@@ -55,6 +55,9 @@ def get_info(videoid, item, raw_data, profile_language_code='', delayed_db_op=Fa
         cache_entry = G.CACHE.get(CACHE_INFOLABELS, cache_identifier)
         infos = cache_entry['infos']
         quality_infos = cache_entry['quality_infos']
+        if _refresh_missing_plot(infos, item):
+            G.CACHE.add(CACHE_INFOLABELS, cache_identifier, {'infos': infos, 'quality_infos': quality_infos},
+                        delayed_db_op=delayed_db_op)
     except CacheMiss:
         infos, quality_infos = parse_info(videoid, item, raw_data, common_data)
         G.CACHE.add(CACHE_INFOLABELS, cache_identifier, {'infos': infos, 'quality_infos': quality_infos},
@@ -66,6 +69,20 @@ def get_info(videoid, item, raw_data, profile_language_code='', delayed_db_op=Fa
         infos_copy['Plot'] = infos_copy['PlotOutline']
     _add_supplemental_plot_info(infos_copy, item, common_data)
     return infos_copy, quality_infos
+
+
+
+def _refresh_missing_plot(infos, item):
+    if infos.get('Plot') or infos.get('PlotOutline'):
+        return False
+    synopsis = common.get_path_safe(['synopsis', 'value'], item)
+    if not synopsis:
+        synopsis = common.get_path_safe(['regularSynopsis', 'value'], item)
+    if not synopsis:
+        return False
+    infos['Plot'] = synopsis
+    infos['PlotOutline'] = synopsis
+    return True
 
 
 def add_info_list_item(list_item: ListItemW, videoid, item, raw_data, is_in_mylist, common_data, art_item=None,
@@ -132,6 +149,12 @@ def get_art(videoid, item, profile_language_code='', delayed_db_op=False):
     cache_identifier = f'{videoid.value}_{profile_language_code}'
     try:
         art = G.CACHE.get(CACHE_ARTINFO, cache_identifier)
+        parsed_art = parse_art(videoid, item)
+        if any(parsed_art.get(key) and not art.get(key)
+               for key in ('poster', 'fanart', 'thumb', 'landscape')):
+            art.update({key: value for key, value in parsed_art.items() if value})
+            G.CACHE.add(CACHE_ARTINFO, cache_identifier, art,
+                        delayed_db_op=delayed_db_op)
     except CacheMiss:
         art = parse_art(videoid, item)
         G.CACHE.add(CACHE_ARTINFO, cache_identifier, art,
@@ -317,32 +340,39 @@ def set_watched_status(list_item: ListItemW, video_data, common_data):
     resume_time = 0
     video_runtime = video_data.get('runtime', {}).get('value', 0)
     if is_watched_user_overrided is None:
-        # Note to shakti properties:
-        # 'watched':  unlike the name this value is used to other purposes, so not to set a video as watched
-        # 'watchedToEndOffset':  this value is used to determine if a video is watched but
-        #                        is available only with the metadata api and only for "episode" video type
-        # 'creditsOffset' :  this value is used as position where to show the (play) "Next" (episode) button
-        #                    on the website, but it may not be always available with the "movie" video type
-        credits_offset_val = video_data.get('creditsOffset', {}).get('value', 0)
-        if credits_offset_val > 0:
-            # To better ensure that a video is marked as watched also when a user do not reach the ending credits
-            # we generally lower the watched threshold by 50 seconds for 50 minutes of video (3000 secs)
-            lower_value = video_runtime / 3000 * 50
-            watched_threshold = credits_offset_val - lower_value
+        graphql_playcount = video_data.get('_graphql_playcount', {}).get('value')
+        if graphql_playcount is not None:
+            playcount = int(graphql_playcount)
+            bookmark_position = video_data.get('bookmarkPosition', {}).get('value', 0)
+            if playcount == 0 and bookmark_position > 0:
+                resume_time = bookmark_position
         else:
-            # When missing the value should be only a video of movie type,
-            # then we simulate the default Kodi playcount behaviour (playcountminimumpercent)
-            watched_threshold = video_runtime / 100 * 90
-        # To avoid asking to the server again the entire list of titles (after watched a video)
-        # to get the updated value, we override the value with the value saved in memory (see am_video_events.py)
-        try:
-            bookmark_position = G.CACHE.get(CACHE_BOOKMARKS, video_id)
-        except CacheMiss:
-            # NOTE shakti 'bookmarkPosition' tag when it is not set have -1 value
-            bookmark_position = video_data['bookmarkPosition'].get('value', 0)
-        playcount = 1 if 0 < watched_threshold <= bookmark_position else 0
-        if playcount == 0 and bookmark_position > 0:
-            resume_time = bookmark_position
+            # Note to shakti properties:
+            # 'watched':  unlike the name this value is used to other purposes, so not to set a video as watched
+            # 'watchedToEndOffset':  this value is used to determine if a video is watched but
+            #                        is available only with the metadata api and only for "episode" video type
+            # 'creditsOffset' :  this value is used as position where to show the (play) "Next" (episode) button
+            #                    on the website, but it may not be always available with the "movie" video type
+            credits_offset_val = video_data.get('creditsOffset', {}).get('value', 0)
+            if credits_offset_val > 0:
+                # To better ensure that a video is marked as watched also when a user do not reach the ending credits
+                # we generally lower the watched threshold by 50 seconds for 50 minutes of video (3000 secs)
+                lower_value = video_runtime / 3000 * 50
+                watched_threshold = credits_offset_val - lower_value
+            else:
+                # When missing the value should be only a video of movie type,
+                # then we simulate the default Kodi playcount behaviour (playcountminimumpercent)
+                watched_threshold = video_runtime / 100 * 90
+            # To avoid asking to the server again the entire list of titles (after watched a video)
+            # to get the updated value, we override the value with the value saved in memory (see am_video_events.py)
+            try:
+                bookmark_position = G.CACHE.get(CACHE_BOOKMARKS, video_id)
+            except CacheMiss:
+                # NOTE shakti 'bookmarkPosition' tag when it is not set have -1 value
+                bookmark_position = video_data['bookmarkPosition'].get('value', 0)
+            playcount = 1 if 0 < watched_threshold <= bookmark_position else 0
+            if playcount == 0 and bookmark_position > 0:
+                resume_time = bookmark_position
     else:
         playcount = 1 if is_watched_user_overrided else 0
     # We have to set playcount with setInfo(), because the setProperty('PlayCount', ) have a bug

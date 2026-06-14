@@ -7,15 +7,15 @@
     SPDX-License-Identifier: MIT
     See LICENSES/MIT.md for more information.
 """
-from resources.lib.utils.data_types import merge_data_type
-from resources.lib.common.exceptions import CacheMiss
+from resources.lib.utils.data_types import merge_data_type, CustomVideoList
+from resources.lib.common.exceptions import CacheMiss, InvalidVideoListTypeError
 from resources.lib.common import VideoId
 from resources.lib.globals import G
 from resources.lib.services.nfsession.directorybuilder.dir_builder_items \
     import (build_video_listing, build_subgenres_listing, build_season_listing, build_episode_listing,
             build_loco_listing, build_mainmenu_listing, build_profiles_listing, build_lolomo_category_listing)
 from resources.lib.services.nfsession.directorybuilder.dir_path_requests import DirectoryPathRequests
-from resources.lib.utils.logging import measure_exec_time_decorator
+from resources.lib.utils.logging import LOG, measure_exec_time_decorator
 
 
 class DirectoryBuilder(DirectoryPathRequests):
@@ -76,10 +76,22 @@ class DirectoryBuilder(DirectoryPathRequests):
 
     @measure_exec_time_decorator(is_immediate=True)
     def get_video_list(self, list_id, menu_data, is_dynamic_id):
-        if not is_dynamic_id:
-            list_id = self.get_loco_list_id_by_context(menu_data['loco_contexts'][0])
-        # pylint: disable=unexpected-keyword-arg
-        video_list = self.req_video_list(list_id, no_use_cache=menu_data.get('no_use_cache'))
+        menu_id = menu_data['path'][1]
+        current_contexts = {
+            'chosenForYou': ('windowedNewReleases',),
+            'currentTitles': ('windowedNewReleases',),
+            'mostViewed': ('mostWatched',)
+        }
+        if not is_dynamic_id and menu_id == 'continueWatching':
+            video_list = self._video_list_from_genre_context('1592210', ('continueWatching',))
+        elif not is_dynamic_id and menu_id in current_contexts:
+            video_list = self._video_list_from_lolomo_category_context(
+                'comingSoon', current_contexts[menu_id], fallback_first=True)
+        else:
+            if not is_dynamic_id:
+                list_id = self.get_loco_list_id_by_context(menu_data['loco_contexts'][0])
+            # pylint: disable=unexpected-keyword-arg
+            video_list = self.req_video_list(list_id, menu_data=menu_data, no_use_cache=menu_data.get('no_use_cache'))
         return build_video_listing(video_list, menu_data,
                                    mylist_items=self.req_mylist_items())
 
@@ -93,14 +105,44 @@ class DirectoryBuilder(DirectoryPathRequests):
             # -In the video list: 'sub-genre id'
             # -In the list of genres: 'sub-genre id'
             context_id = pathitems[2]
-        # pylint: disable=unexpected-keyword-arg
-        video_list = self.req_video_list_sorted(menu_data['request_context_name'],
-                                                context_id=context_id,
-                                                perpetual_range_start=perpetual_range_start,
-                                                menu_data=menu_data,
-                                                no_use_cache=menu_data.get('no_use_cache'))
+        if menu_data['path'][1] == 'recentlyAdded' and context_id:
+            video_list = self._video_list_from_lolomo_category_context(
+                'comingSoon', ('windowedNewReleases', 'newThisWeek', 'newOnNetflix', 'newOnNetflixThisWeek'),
+                fallback_first=True)
+        else:
+            # pylint: disable=unexpected-keyword-arg
+            video_list = self.req_video_list_sorted(menu_data['request_context_name'],
+                                                    context_id=context_id,
+                                                    perpetual_range_start=perpetual_range_start,
+                                                    menu_data=menu_data,
+                                                    no_use_cache=menu_data.get('no_use_cache'))
         return build_video_listing(video_list, menu_data, sub_genre_id, pathitems, perpetual_range_start,
                                    self.req_mylist_items())
+
+    def _video_list_from_lolomo_category_context(self, category_name, contexts, fallback_first=False):
+        if isinstance(contexts, str):
+            contexts = (contexts,)
+        first_list_id = None
+        for list_id, summary, video_list in self.req_lolomo_category(category_name).lists():
+            if not first_list_id and video_list.videos:
+                first_list_id = list_id
+            if summary.get('context') in contexts:
+                return self._browser_lolomo_video_list_by_id(category_name, list_id)
+        if fallback_first and first_list_id:
+            return self._browser_lolomo_video_list_by_id(category_name, first_list_id)
+        raise InvalidVideoListTypeError(f'No LoLoMo category list with context {contexts} available')
+
+    def _video_list_from_genre_context(self, genre_id, contexts):
+        if isinstance(contexts, str):
+            contexts = (contexts,)
+        try:
+            loco_list = self.req_loco_list_genre(genre_id)
+            for list_id, video_list in loco_list.lists.items():
+                if video_list.get('context') in contexts:
+                    return self._browser_genre_video_list_by_id(genre_id, list_id)
+        except Exception as exc:
+            LOG.warn('Continue Watching genre fallback failed: {}', exc)
+        return CustomVideoList({'videos': {}})
 
     @measure_exec_time_decorator(is_immediate=True)
     def get_video_list_sorted_sp(self, pathitems, menu_data, context_name, context_id, perpetual_range_start):
@@ -139,6 +181,8 @@ class DirectoryBuilder(DirectoryPathRequests):
         if genre_id:
             # Load the LoCo list of the specified genre
             loco_list = self.req_loco_list_genre(genre_id)
+        elif menu_data['path'][1] == 'recommendations':
+            return build_lolomo_category_listing(self.req_lolomo_category('comingSoon'), menu_data)
         else:
             # Load the LoCo root list filtered by 'loco_contexts' specified in the menu_data
             loco_list = self.req_loco_list_root()
@@ -178,6 +222,11 @@ class DirectoryBuilder(DirectoryPathRequests):
         :param video_id: videoid as [string] value
         :return: a tuple ([bool] true if videoid exists, [string] the current list id, that depends from loco id)
         """
-        list_id = self.get_loco_list_id_by_context('continueWatching')
-        video_list = self.req_video_list(list_id).videos if video_id else []
+        try:
+            list_id = self.get_loco_list_id_by_context('continueWatching')
+            video_list = self.req_video_list(list_id).videos if video_id else []
+        except Exception:
+            current_list = self._video_list_from_genre_context('1592210', ('continueWatching',))
+            list_id = current_list.videoid.value if getattr(current_list, 'videoid', None) else None
+            video_list = current_list.videos if video_id else []
         return video_id in video_list, list_id

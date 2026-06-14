@@ -23,6 +23,7 @@ from resources.lib.kodi import ui
 from resources.lib.services.nfsession.session.base import SessionBase
 from resources.lib.services.nfsession.session.endpoints import ENDPOINTS, BASE_URL
 from resources.lib.utils import cookies
+from resources.lib.utils.esn import get_website_esn
 from resources.lib.utils.logging import LOG, measure_exec_time_decorator
 
 
@@ -161,6 +162,8 @@ class SessionHTTPRequests(SessionBase):
             headers['x-netflix.request.client.user.guid'] = G.LOCAL_DB.get_active_profile_guid()
         if endpoint_conf.get('content_type'):
             headers['Content-Type'] = endpoint_conf['content_type']
+        if endpoint_conf['address'] == '/pathEvaluator':
+            _add_path_evaluator_headers(headers)
         headers.update(custom_headers)  # If needed override headers
         # Meanings parameters known:
         # drmSystem       DRM used
@@ -170,12 +173,12 @@ class SessionHTTPRequests(SessionBase):
         #                   it is still added in an 'empty' form in the response
         if endpoint_conf['use_default_params']:
             params = {
-                'webp': 'true',
+                'webp': 'false',
                 'drmSystem': 'widevine',
                 'isVolatileBillboardsEnabled': 'true',
                 'isTop10Supported': 'true',
-                'hasVideoMerchInBob': 'true',
-                'hasVideoMerchInJaw': 'true',
+                'hasVideoMerchInBob': 'false',
+                'hasVideoMerchInJaw': 'false',
                 'falcor_server': '0.1.0',
                 'withSize': 'true',
                 'materialize': 'true',
@@ -211,6 +214,45 @@ def _document_url(endpoint_address, kwargs):
 def _api_url(endpoint_address):
     baseurl = G.LOCAL_DB.get_value('api_endpoint_url', table=TABLE_SESSION)
     return f'{baseurl}{endpoint_address}'
+
+
+def _add_path_evaluator_headers(headers):
+    """Add browser-equivalent metadata required by current website pathEvaluator requests."""
+    headers.update({
+        'Origin': BASE_URL,
+        'Referer': f'{BASE_URL}/browse',
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-origin',
+        'X-Netflix.browserName': 'Firefox',
+        'X-Netflix.clientType': 'akira',
+        'x-netflix.request.attempt': '1',
+        'x-netflix.request.client.context': 'www.netflix.com'
+    })
+    _set_header_if_value(
+        headers, 'X-Netflix.browserVersion',
+        G.LOCAL_DB.get_value('browser_info_version', '', table=TABLE_SESSION))
+    _set_header_if_value(
+        headers, 'X-Netflix.osName',
+        G.LOCAL_DB.get_value('browser_info_os_name', '', table=TABLE_SESSION))
+    _set_header_if_value(
+        headers, 'X-Netflix.osVersion',
+        G.LOCAL_DB.get_value('browser_info_os_version', '', table=TABLE_SESSION))
+    _set_header_if_value(
+        headers, 'X-Netflix.uiVersion',
+        G.LOCAL_DB.get_value('ui_version', '', table=TABLE_SESSION))
+    _set_header_if_value(
+        headers, 'x-netflix.request.id',
+        G.LOCAL_DB.get_value('request_id', '', table=TABLE_SESSION))
+    website_esn = get_website_esn()
+    if website_esn:
+        headers['X-Netflix.esn'] = website_esn
+        headers['X-Netflix.esnPrefix'] = website_esn.rsplit('-', 1)[0] if '-' in website_esn else website_esn
+
+
+def _set_header_if_value(headers, name, value):
+    if value:
+        headers[name] = value
 
 
 def _raise_api_error(decoded_response):
