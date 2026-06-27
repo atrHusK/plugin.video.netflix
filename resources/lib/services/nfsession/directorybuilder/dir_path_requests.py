@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+# pylint: disable=too-many-lines,too-many-branches
 """
     Copyright (C) 2017 Sebastian Golasch (plugin.video.netflix)
     Copyright (C) 2020 Stefano Gottardo (original implementation module)
@@ -1400,8 +1400,9 @@ class DirectoryPathRequests:
 
     @cache_utils.cache_output(cache_utils.CACHE_COMMON, identify_append_from_kwarg_name='perpetual_range_start',
                               ignore_self_class=True)
-    def req_video_list(self, list_id, perpetual_range_start=None, menu_data=None):
+    def req_video_list(self, list_id, perpetual_range_start=None, menu_data=None, **kwargs):
         """Retrieve a video list"""
+        _ = kwargs  # Ignore kwargs, here for IDE, they are actually swallowed by cache_utils.cache_output
         # Some of this type of request have results fixed at ~40 from netflix
         # The 'length' tag never return to the actual total count of the elements
         LOG.debug('Requesting video list {}', list_id)
@@ -1430,8 +1431,10 @@ class DirectoryPathRequests:
 
     @cache_utils.cache_output(cache_utils.CACHE_COMMON, identify_from_kwarg_name='context_id',
                               identify_append_from_kwarg_name='perpetual_range_start', ignore_self_class=True)
-    def req_video_list_sorted(self, context_name, context_id=None, perpetual_range_start=None, menu_data=None):
+    def req_video_list_sorted(self, context_name, context_id=None, perpetual_range_start=None,
+                              menu_data=None, **kwargs):
         """Retrieve a video list sorted"""
+        _ = kwargs  # Ignore kwargs, here for IDE, they are actually swallowed by cache_utils.cache_output
         # This type of request allows to obtain more than ~40 results
         LOG.debug('Requesting video list sorted for context name: "{}", context id: "{}"',
                   context_name, context_id)

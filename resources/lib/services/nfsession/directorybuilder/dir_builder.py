@@ -233,18 +233,18 @@ class DirectoryBuilder(DirectoryPathRequests):
                     except Exception as exc:  # pylint: disable=broad-except
                         LOG.warn('Using materialized genre row {} after list lookup failed: {}', list_id, exc)
                         return video_list
-        except Exception as exc:
+        except Exception as exc:  # pylint: disable=broad-except
             LOG.warn('Continue Watching genre fallback failed: {}', exc)
         return CustomVideoList({'videos': {}})
 
     @measure_exec_time_decorator(is_immediate=True)
-    def get_video_list_sorted_sp(self, pathitems, menu_data, context_name, context_id, perpetual_range_start):
+    def get_video_list_sorted_sp(self, path_items, menu_data, context_name, context_id, perpetual_range_start):
         # Method used for the menu search
         video_list = self.req_videos_list_sorted(context_name,
                                                  context_id=context_id,
                                                  perpetual_range_start=perpetual_range_start,
                                                  menu_data=menu_data)
-        return build_video_listing(video_list, menu_data, None, pathitems, perpetual_range_start,
+        return build_video_listing(video_list, menu_data, None, path_items, perpetual_range_start,
                                    self.req_mylist_items())
 
     @measure_exec_time_decorator(is_immediate=True)
@@ -323,7 +323,8 @@ class DirectoryBuilder(DirectoryPathRequests):
         try:
             list_id = self.get_loco_list_id_by_context('continueWatching')
             video_list = self.req_video_list(list_id).videos if video_id else []
-        except Exception:
+        except Exception as exc:  # pylint: disable=broad-except
+            _ = exc # Silence IDE warning, code seems to intentionally ignoring any exception
             current_list = self._video_list_from_genre_context('1592210', ('continueWatching',))
             list_id = current_list.videoid.value if getattr(current_list, 'videoid', None) else None
             video_list = current_list.videos if video_id else []
