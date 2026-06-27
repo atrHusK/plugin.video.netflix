@@ -81,10 +81,9 @@ class NFSessionOperations(SessionPathRequests):
             self.dt_initial_page_prefetch = None
             return
         LOG.debug('Fetch initial page')
-        from requests import exceptions
         try:
             self.refresh_session_data(True)
-        except exceptions.TooManyRedirects:
+        except req_exceptions.TooManyRedirects:
             # This error can happen when the profile used in nf session actually no longer exists,
             # something wrong happen in the session then the server try redirect to the login page without success.
             # (CastagnaIT: i don't know the best way to handle this borderline case, but login again works)
@@ -122,7 +121,6 @@ class NFSessionOperations(SessionPathRequests):
 
     def parental_control_data(self, guid, password):
         # Ask to the service if password is right and get the PIN status
-        from requests import exceptions
         try:
             response = self.post_safe('profile_hub',
                                       data={'destination': 'contentRestrictions',
@@ -132,7 +130,7 @@ class NFSessionOperations(SessionPathRequests):
             if response.get('status') != 'ok':
                 LOG.warn('Parental control status issue: {}', response)
                 raise MissingCredentialsError
-        except exceptions.HTTPError as exc:
+        except req_exceptions.HTTPError as exc:
             if exc.response.status_code == 500:
                 # This endpoint raise HTTP error 500 when the password is wrong
                 raise MissingCredentialsError from exc

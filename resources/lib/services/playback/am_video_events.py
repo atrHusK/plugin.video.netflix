@@ -10,10 +10,11 @@
 from typing import TYPE_CHECKING
 import time
 
+import requests.exceptions as req_exceptions
+
 from resources.lib import common
 from resources.lib.common.cache_utils import CACHE_BOOKMARKS, CACHE_COMMON, CACHE_MANIFESTS
 from resources.lib.common.exceptions import InvalidVideoListTypeError
-import requests.exceptions as req_exceptions
 from resources.lib.globals import G
 from resources.lib.services.nfsession.msl.msl_utils import EVENT_ENGAGE, EVENT_START, EVENT_STOP, EVENT_KEEP_ALIVE
 from resources.lib.utils.api_paths import build_paths, EVENT_PATHS
@@ -160,7 +161,7 @@ class AMVideoEvents(ActionManager):
         # quickly get the data and speed up a lot the GUI response.
         # Watched status of a (video) list item is based on resume time, and the resume time is saved in the cache data.
         # To avoid slowing down the GUI by invalidating the cache to get new data from website service, one solution is
-        # save the values in memory and override the bookmark value of the infolabel.
+        # to save the values in memory and override the bookmark value of the infolabel.
         # The callback _on_playback_stopped can not be used, because the loading of frontend happen before.
         G.CACHE.add(CACHE_BOOKMARKS, self.videoid.value, resume_time)
 
