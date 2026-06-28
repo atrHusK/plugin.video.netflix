@@ -7,7 +7,7 @@
     SPDX-License-Identifier: MIT
     See LICENSES/MIT.md for more information.
 """
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, List, Union, Iterable
 from collections import OrderedDict
 from types import SimpleNamespace
 import json
@@ -89,6 +89,8 @@ METADATA_REFERENCE_KEYS = {
     'genres': ('genres', ('genres', 'genre', 'tags'))
 }
 
+MetadataDict = Dict[str, Any]
+MetadataValue = Union[MetadataDict, List[Any], str, None]
 
 def _value(value):
     return {'value': value}
@@ -101,7 +103,7 @@ def _has_reference_entries(item, source):
     return any(common.is_numeric(key) for key in refs)
 
 
-def _metadata_names_from_value(value):
+def _metadata_names_from_value(value: MetadataValue) -> List[str]:
     if not value:
         return []
     if isinstance(value, str):
@@ -259,11 +261,17 @@ def _add_metadata_references(path_response, item, source, target, names):
         refs[str(index)] = {'$type': 'ref', 'value': [target, ref_id]}
 
 
-def normalize_metadata_references(path_response, video_id, metadata_video, item=None):
+def normalize_metadata_references(path_response: MetadataDict,
+                                  video_id: str,
+                                  metadata_video: MetadataValue,
+                                  item: MetadataValue = None):
     """Copy metadata people/genre fields into the JSON graph reference shape."""
     if not isinstance(metadata_video, dict):
         return
-    item = item or path_response.get('videos', {}).get(str(video_id))
+    if item is None:
+        videos = path_response.get('videos')
+        if isinstance(videos, dict):
+            item = videos.get(video_id)
     if not isinstance(item, dict):
         return
     for source, (target, keys) in METADATA_REFERENCE_KEYS.items():
@@ -489,19 +497,23 @@ def _graphql_cache_node(graphql_data, typename, video_id):
     return None
 
 
-def _graphql_ref_node(graphql_data, node_or_ref):
+def _graphql_ref_node(graphql_data: MetadataDict,
+                      node_or_ref: MetadataValue) -> MetadataValue:
     if not isinstance(node_or_ref, dict):
         return None
     ref = node_or_ref.get('__ref')
-    if ref:
+    if isinstance(ref, str):
         return graphql_data.get(ref)
     return node_or_ref
 
-
-def _iter_graphql_edges(value):
+def _iter_graphql_edges(value: MetadataValue) -> Iterable[Any]:
     if isinstance(value, dict) and '__ref' in value:
         return []
-    edges = value.get('edges') if isinstance(value, dict) else value
+    if isinstance(value, dict):
+        edges = value.get('edges')
+    else:
+        edges = value
+
     if isinstance(edges, dict):
         return edges.values()
     if isinstance(edges, list):
@@ -875,7 +887,7 @@ class DirectoryPathRequests:
         except (MetadataNotAvailable, KeyError, TypeError, req_exceptions.RequestException):
             return ''
 
-    def _metadata_episodes_by_id(self, videoid):
+    def _metadata_episodes_by_id(self, videoid) -> Dict[str, Any]:
         try:
             metadata_data = self.nfsession.get_safe(
                 endpoint='metadata',
@@ -1149,54 +1161,6 @@ class DirectoryPathRequests:
             *_browser_reference_paths(row_path + ['page', 0, item_range, 'reference'],
                                       include_metadata=include_metadata)
         ]
-
-    def _browser_mylist_loco_video_list(self, root_id, row_key, list_id, auth_url):
-        for use_direct_range in (True, False):
-            metadata_paths = self._browser_mylist_loco_row_paths(root_id, row_key, use_direct_range,
-                                                                 include_metadata=True)
-            light_paths = self._browser_mylist_loco_row_paths(root_id, row_key, use_direct_range)
-            try:
-                try:
-                    path_response = self._post_current_loco_paths(metadata_paths, auth_url)
-                except req_exceptions.HTTPError as exc:
-                    status_code = getattr(exc.response, 'status_code', None)
-                    if status_code not in (404, 412):
-                        raise
-                    LOG.warn('My List LoCo metadata fields request returned {}; retrying light fields',
-                             status_code)
-                    path_response = self._post_current_loco_paths(light_paths, auth_url)
-                if str(list_id) in path_response.get('lists', {}):
-                    return VideoList(path_response, str(list_id))
-            except req_exceptions.HTTPError as exc:
-                if getattr(exc.response, 'status_code', None) not in (404, 412):
-                    raise
-                LOG.warn('My List LoCo row content request returned {}; trying fallback path',
-                         exc.response.status_code)
-        raise InvalidVideoListTypeError('No current LoCo My List content available')
-
-    def _browser_mylist_direct_video_list(self, list_id, auth_url):
-        for paths, fallback_paths in (
-                (self._browser_video_list_full_paths(str(list_id), include_metadata=True),
-                 self._browser_video_list_full_paths(str(list_id))),
-                (self._browser_video_list_paths(str(list_id), include_metadata=True),
-                 self._browser_video_list_paths(str(list_id)))):
-            try:
-                try:
-                    path_response = self._post_current_loco_paths(paths, auth_url)
-                except req_exceptions.HTTPError as exc:
-                    status_code = getattr(exc.response, 'status_code', None)
-                    if status_code not in (404, 412):
-                        raise
-                    LOG.warn('My List direct metadata fields request returned {}; retrying light fields',
-                             status_code)
-                    path_response = self._post_current_loco_paths(fallback_paths, auth_url)
-                return VideoList(path_response, str(list_id))
-            except req_exceptions.HTTPError as exc:
-                if getattr(exc.response, 'status_code', None) not in (404, 412):
-                    raise
-                LOG.warn('My List direct list content request returned {}; trying fallback path',
-                         exc.response.status_code)
-        raise InvalidVideoListTypeError('No current direct My List content available')
 
     def _browser_mylist_video_list(self):
         browse_bytes = self.nfsession.get_safe('browse')
