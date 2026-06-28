@@ -78,7 +78,7 @@ ENDPOINTS = {
          'add_auth_url': None,
          'accept': '*/*'},
     'profile_lock':
-        {'address': '/api/shakti/mre/profileLock',
+        {'address': '/nq/website/memberapi/release/profileLock',
          'is_api_call': False,
          'use_default_params': False,
          'add_auth_url': 'to_data',
