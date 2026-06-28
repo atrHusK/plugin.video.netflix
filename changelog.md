@@ -4,11 +4,13 @@ v1.24.1 (2026-06-27)
   See https://github.com/CastagnaIT/plugin.video.netflix/pull/1791
 - Should fix 'Website parsing error: unable to extract reactContext.' (biocoder-frodo)  
   See https://github.com/CastagnaIT/plugin.video.netflix/pull/1727
-- Should fix 'Profile switching' at-least partially, (Krumbthi)  
+- Fixes 'Profile switching' to profiles without pin (Krumbthi)  
   See https://github.com/CastagnaIT/plugin.video.netflix/pull/1783
 - Fixes plugin no longer functional due to even more API changes by Netflix (go-vegan)  
   Using patch 8, see https://github.com/CastagnaIT/plugin.video.netflix/issues/1792  
   NB. That patch also contains the work from the others mentioned above.
+- Fixed profile switching to a pin locked profile (AtrHusK)
+- Developers: Fixed GitHub producing a release with the updated code; Added option to build a prerelease 
 
 v1.24.0  (2026-06-24)
 - Experimental merge, abandoned.

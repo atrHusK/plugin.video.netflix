@@ -90,8 +90,9 @@
 - New experimental merge, personal testing done only for Pi4 @ latest OSMC
 - Should fix playback issues than can sometimes occur, like not starting at all or sound-only playback (jankofron)
 - Should fix 'Website parsing error: unable to extract reactContext.' (biocoder-frodo)
-- Should fix 'Profile switching' at-least partially, (Krumbthi)
+- Fixes 'Profile switching' to profiles without pin (Krumbthi)
 - Fixes plugin no longer functional due to even more API changes by Netflix (go-vegan)
+- Fixed profile switching to a pin locked profile (AtrHusK)
     </news>
   </extension>
 </addon>
