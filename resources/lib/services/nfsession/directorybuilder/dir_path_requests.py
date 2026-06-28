@@ -275,7 +275,10 @@ def normalize_metadata_references(path_response: MetadataDict,
     if not isinstance(item, dict):
         return
     for source, (target, keys) in METADATA_REFERENCE_KEYS.items():
-        _add_metadata_references(path_response, item, source, target, _metadata_names(metadata_video, keys))
+        _add_metadata_references(
+            path_response, item, source, target,
+            _metadata_names(metadata_video, keys)
+        )
     _add_metadata_trailer(item, metadata_video)
 
 
@@ -932,10 +935,14 @@ class DirectoryPathRequests:
             'summary': _summary(videoid.seasonid, season_data.get('title') or '', 'season', season_number, len(episodes)),
             'title': _value(season_data.get('title') or '')
         }
-        path_response = {'videos': {videoid.tvshowid: tvshow}, 'seasons': {videoid.seasonid: season},
+        path_response = {'videos': {videoid.tvshowid: tvshow},
+                         'seasons': {videoid.seasonid: season},
                          'episodes': episodes}
         for episode_id, episode in episodes.items():
-            normalize_metadata_references(path_response, episode_id, metadata_by_id.get(str(episode_id)), episode)
+            normalize_metadata_references(path_response,
+                                          episode_id,
+                                          metadata_by_id.get(str(episode_id)),
+                                          episode)
         return SimpleNamespace(
             perpetual_range_selector=None,
             data=path_response,
@@ -1048,7 +1055,9 @@ class DirectoryPathRequests:
         _normalize_browser_video_fields(path_response)
         return path_response
 
-    def _browser_loco_paths(self, root_path, include_genre_paths=False, include_full_rows=False,
+    def _browser_loco_paths(self, root_path,
+                            include_genre_paths=False,
+                            include_full_rows=False,
                             include_metadata=False):
         paths = [
             root_path + [['componentSummary', 'debugRequest']],
@@ -1505,12 +1514,12 @@ class DirectoryPathRequests:
         path = build_paths(
             ['videos', videoid.value, supplemental_type, {"from": 0, "to": 35}], TRAILER_PARTIAL_PATHS
         )
-        parent_metadata = {'loaded': False, 'value': None}
+        parent_metadata: Dict[str, Any] = {'loaded': False, 'value': None}
 
         def _get_parent_metadata():
             if not parent_metadata['loaded']:
                 parent_metadata['loaded'] = True
-                parent_metadata['value'] = self._metadata_for_video(videoid.value, 'Parent supplemental')
+                parent_metadata['value'] = self._metadata_for_video(videoid.value, 'Parent supplemental', True)
             return parent_metadata['value']
 
         def _inherit_parent_metadata(video_list):
@@ -1621,21 +1630,25 @@ class DirectoryPathRequests:
                     video_id, video_data = item
                     videos.setdefault(video_id, video_data)
         for video_id, video_data in list(videos.items()):
-            metadata_video = self._metadata_for_video(video_id, 'Search')
+            metadata_video = self._metadata_for_video(video_id, 'Search', False)
             if metadata_video:
                 videos[video_id] = _merge_search_metadata_video(video_data, metadata_video)
                 normalize_metadata_references(path_response, video_id, metadata_video, videos[video_id])
         return CustomVideoList(path_response)
 
-    def _metadata_for_video(self, video_id, context):
+    def _metadata_for_video(self, video_id: str, context: str, fallback: bool = False) -> MetadataDict:
         try:
             metadata_data = self.nfsession.get_safe(
                 endpoint='metadata',
                 params={'movieid': video_id, '_': int(time.time() * 1000)})
-            return metadata_with_title_page_fallback(video_id, metadata_data.get('video') or {})
+            if fallback:
+                return metadata_with_title_page_fallback(video_id, metadata_data.get('video') or {})
+            return metadata_data.get('video') or {}
         except (MetadataNotAvailable, KeyError, TypeError, req_exceptions.RequestException):
             LOG.warn('{} metadata enrichment skipped for video {}', context, video_id)
-            return metadata_with_title_page_fallback(video_id)
+            if fallback:
+                return metadata_with_title_page_fallback(video_id)
+            return {}
 
     def req_subgenres(self, genre_id):
         """Retrieve sub-genres for the given genre"""
