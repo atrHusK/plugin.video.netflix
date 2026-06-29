@@ -1,5 +1,4 @@
 v1.24.1 (2026-06-29)
-- New experimental merge, personal testing done only for Pi4 @ latest OSMC
 - Should fix playback issues than can sometimes occur, like not starting at all or sound-only playback (jankofron)  
   See https://github.com/CastagnaIT/plugin.video.netflix/pull/1791
 - Should fix 'Website parsing error: unable to extract reactContext' (biocoder-frodo)  

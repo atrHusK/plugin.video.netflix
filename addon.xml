@@ -87,7 +87,6 @@
     <forum>https://forum.kodi.tv/showthread.php?tid=329767</forum>
     <source>https://github.com/CastagnaIT/plugin.video.netflix</source>
     <news>v1.24.1 (2026-06-29)
-- New experimental merge, personal testing done only for Pi4 @ latest OSMC
 - Should fix playback issues than can sometimes occur, like not starting at all or sound-only playback (jankofron)
 - Should fix 'Website parsing error: unable to extract reactContext' (biocoder-frodo)
 - Fixes 'Profile switching' to profiles without pin (Krumbthi)
