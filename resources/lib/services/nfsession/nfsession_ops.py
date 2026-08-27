@@ -265,8 +265,9 @@ class NFSessionOperations(SessionPathRequests):
             LOG.warn('Video info pathEvaluator lookup failed: {}. Falling back to metadata endpoint.', exc)
             raw_data = self._get_videoid_info_metadata(videoid)
         infos = get_info(videoid, raw_data['videos'][videoid.value], raw_data, profile_language_code)[0]
-        if videoid.mediatype != common.VideoId.EPISODE and not infos.get('Trailer'):
-            LOG.debug('Video info for {} is missing trailer; refreshing from metadata endpoint', videoid)
+        if (videoid.mediatype != common.VideoId.EPISODE and
+                (not infos.get('Cast') or not infos.get('Trailer'))):
+            LOG.debug('Video info for {} is missing cast/trailer; refreshing from metadata endpoint', videoid)
             raw_data = self._get_videoid_info_metadata(videoid)
             infos = get_info(videoid, raw_data['videos'][videoid.value], raw_data, profile_language_code)[0]
         art = get_art(videoid, raw_data['videos'][videoid.value], profile_language_code)

@@ -57,13 +57,15 @@ def get_info(videoid, item, raw_data, profile_language_code='', delayed_db_op=Fa
         quality_infos = cache_entry['quality_infos']
         updated = False
         updated = _refresh_missing_plot(infos, item) or updated
-        updated = _refresh_missing_atomic_infos(infos, item, ('Trailer',)) or updated
+        updated = _refresh_missing_atomic_infos(infos, item, ('Trailer', 'Year')) or updated
         updated = _refresh_missing_referenced_infos(infos, item, raw_data) or updated
+        updated = _refresh_missing_profile_cast(infos, videoid, profile_language_code) or updated
         if updated:
             G.CACHE.add(CACHE_INFOLABELS, cache_identifier, {'infos': infos, 'quality_infos': quality_infos},
                         delayed_db_op=delayed_db_op)
     except CacheMiss:
         infos, quality_infos = parse_info(videoid, item, raw_data, common_data)
+        _refresh_missing_profile_cast(infos, videoid, profile_language_code)
         G.CACHE.add(CACHE_INFOLABELS, cache_identifier, {'infos': infos, 'quality_infos': quality_infos},
                     delayed_db_op=delayed_db_op)
     # Use a deepcopy of dict to not reflect changes of the dictionary also to the cache
@@ -112,6 +114,25 @@ def _refresh_missing_atomic_infos(infos, item, targets):
             infos[key] = value
             updated = True
     return updated
+
+
+def _refresh_missing_profile_cast(infos, videoid, profile_language_code):
+    """Reuse language-independent cast names from another infolabel cache key."""
+    if infos.get('Cast'):
+        return False
+    active_language = G.LOCAL_DB.get_profile_config('language', '')
+    for language_code in (active_language, ''):
+        if language_code == profile_language_code:
+            continue
+        try:
+            cached_infos = G.CACHE.get(
+                CACHE_INFOLABELS, f'{videoid.value}_{language_code}')['infos']
+        except (CacheMiss, KeyError, TypeError):
+            continue
+        if cached_infos.get('Cast'):
+            infos['Cast'] = copy.deepcopy(cached_infos['Cast'])
+            return True
+    return False
 
 
 def add_info_list_item(list_item: ListItemW, videoid, item, raw_data, is_in_mylist, common_data, art_item=None,
@@ -417,10 +438,19 @@ def set_watched_status(list_item: ListItemW, video_data, common_data):
     resume_time = 0
     video_runtime = video_data.get('runtime', {}).get('value', 0)
     if is_watched_user_overrided is None:
-        graphql_playcount = video_data.get('_graphql_playcount', {}).get('value')
-        if graphql_playcount is not None:
-            playcount = int(graphql_playcount)
+        # Cached bookmarks are written by AMVideoEvents while playback is active. They must
+        # override list data, including GraphQL fallback items, which remains stale until the
+        # server response and directory caches are refreshed.
+        has_cached_bookmark = True
+        try:
+            bookmark_position = G.CACHE.get(CACHE_BOOKMARKS, video_id)
+        except CacheMiss:
+            has_cached_bookmark = False
+            # NOTE shakti 'bookmarkPosition' tag when it is not set have -1 value
             bookmark_position = video_data.get('bookmarkPosition', {}).get('value', 0)
+        graphql_playcount = video_data.get('_graphql_playcount', {}).get('value')
+        if graphql_playcount is not None and not has_cached_bookmark:
+            playcount = int(graphql_playcount)
             if playcount == 0 and bookmark_position > 0:
                 resume_time = bookmark_position
         else:
@@ -430,7 +460,8 @@ def set_watched_status(list_item: ListItemW, video_data, common_data):
             #                        is available only with the metadata api and only for "episode" video type
             # 'creditsOffset' :  this value is used as position where to show the (play) "Next" (episode) button
             #                    on the website, but it may not be always available with the "movie" video type
-            credits_offset_val = video_data.get('creditsOffset', {}).get('value', 0)
+            credits_offset_val = (video_data.get('creditsOffset', {}).get('value', 0) or
+                                  video_data.get('watchedToEndOffset', {}).get('value', 0))
             if credits_offset_val > 0:
                 # To better ensure that a video is marked as watched also when a user do not reach the ending credits
                 # we generally lower the watched threshold by 50 seconds for 50 minutes of video (3000 secs)
@@ -440,13 +471,6 @@ def set_watched_status(list_item: ListItemW, video_data, common_data):
                 # When missing the value should be only a video of movie type,
                 # then we simulate the default Kodi playcount behaviour (playcountminimumpercent)
                 watched_threshold = video_runtime / 100 * 90
-            # To avoid asking to the server again the entire list of titles (after watched a video)
-            # to get the updated value, we override the value with the value saved in memory (see am_video_events.py)
-            try:
-                bookmark_position = G.CACHE.get(CACHE_BOOKMARKS, video_id)
-            except CacheMiss:
-                # NOTE shakti 'bookmarkPosition' tag when it is not set have -1 value
-                bookmark_position = video_data['bookmarkPosition'].get('value', 0)
             playcount = 1 if 0 < watched_threshold <= bookmark_position else 0
             if playcount == 0 and bookmark_position > 0:
                 resume_time = bookmark_position

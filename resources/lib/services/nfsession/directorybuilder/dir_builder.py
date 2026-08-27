@@ -18,6 +18,7 @@ from resources.lib.services.nfsession.directorybuilder.dir_builder_items \
             build_loco_listing, build_mainmenu_listing, build_profiles_listing, build_lolomo_category_listing)
 from resources.lib.services.nfsession.directorybuilder.dir_path_requests import (DirectoryPathRequests,
                                                                                  _has_reference_entries,
+                                                                                 _metadata_year,
                                                                                  metadata_with_title_page_fallback,
                                                                                  normalize_metadata_references)
 from resources.lib.utils.logging import LOG, measure_exec_time_decorator
@@ -135,7 +136,8 @@ class DirectoryBuilder(DirectoryPathRequests):
                 continue
             needs_art = self._needs_metadata_boxart(video)
             needs_refs = include_refs and not _has_reference_entries(video, 'cast')
-            if not needs_art and not needs_refs:
+            needs_year = not common.get_path_safe(['releaseYear', 'value'], video)
+            if not needs_art and not needs_refs and not needs_year:
                 continue
             try:
                 videoid = VideoId.from_videolist_item(video)
@@ -148,8 +150,14 @@ class DirectoryBuilder(DirectoryPathRequests):
             except Exception as exc:  # pylint: disable=broad-except
                 LOG.debug('Metadata enrichment skipped for {}: {}', videoid, exc)
                 continue
+            if needs_year and not _metadata_year(metadata):
+                metadata = metadata_with_title_page_fallback(videoid.value, metadata)
             if needs_art:
                 self._apply_metadata_art(video, metadata)
+            if needs_year:
+                release_year = _metadata_year(metadata)
+                if release_year:
+                    video['releaseYear'] = {'value': release_year}
             if needs_refs:
                 metadata = metadata_with_title_page_fallback(videoid.value, metadata)
                 normalize_metadata_references(video_list.data, videoid.value, metadata, video)

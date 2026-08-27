@@ -164,6 +164,17 @@ def _metadata_has_trailer(metadata):
     return bool(_metadata_trailer_id(metadata) or _metadata_trailer_url(metadata))
 
 
+def _metadata_year(metadata):
+    if not isinstance(metadata, dict):
+        return 0
+    value = (metadata.get('year') or metadata.get('releaseYear') or
+             metadata.get('dateCreated') or metadata.get('datePublished'))
+    if isinstance(value, int):
+        return value
+    match = re.search(r'\b(18|19|20|21)\d{2}\b', str(value or ''))
+    return int(match.group(0)) if match else 0
+
+
 def _title_page_jsonld_data(content):
     from html import unescape
     html_text = content.decode('utf-8', 'replace') if isinstance(content, bytes) else str(content)
@@ -199,9 +210,11 @@ def _metadata_from_title_page(video_id):
 
 
 def metadata_with_title_page_fallback(video_id, metadata_video=None):
-    """Return metadata enriched with public title page JSON-LD people/trailer fields."""
+    """Return metadata enriched with public title page JSON-LD fields."""
     metadata_video = dict(metadata_video or {})
-    if _metadata_has_reference_names(metadata_video) and _metadata_has_trailer(metadata_video):
+    if (_metadata_has_reference_names(metadata_video) and
+            _metadata_has_trailer(metadata_video) and
+            _metadata_year(metadata_video)):
         return metadata_video
     title_page_metadata = _metadata_from_title_page(video_id)
     if not title_page_metadata:
@@ -209,6 +222,10 @@ def metadata_with_title_page_fallback(video_id, metadata_video=None):
     for key in ('actors', 'directors', 'creators', 'genre', 'trailer'):
         if key in title_page_metadata and key not in metadata_video:
             metadata_video[key] = title_page_metadata[key]
+    if not _metadata_year(metadata_video):
+        title_page_year = _metadata_year(title_page_metadata)
+        if title_page_year:
+            metadata_video['year'] = title_page_year
     return metadata_video
 
 
@@ -430,7 +447,7 @@ def _merge_search_metadata_video(base_video, metadata_video):
     runtime = metadata_video.get('runtime')
     if runtime:
         merged['runtime'] = _value(runtime)
-    release_year = metadata_video.get('year') or metadata_video.get('releaseYear')
+    release_year = _metadata_year(metadata_video)
     if release_year:
         merged['releaseYear'] = _value(release_year)
     seasons = metadata_video.get('seasons') or []
