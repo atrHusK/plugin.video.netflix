@@ -250,6 +250,9 @@ def _repair_browser_boxart_wide_cache(art, parsed_art, item):
         if not art.get('poster') or art.get('poster') in (art.get('landscape'), art.get('fanart'), fallback):
             art['poster'] = parsed_poster
             updated = True
+        elif art.get('thumb') == parsed_poster:
+            art['poster'] = parsed_poster
+            updated = True
     elif parsed_poster and art.get('poster') and art['poster'] != parsed_poster:
         if art['poster'] in (art.get('thumb'), art.get('landscape'), art.get('fanart')):
             old_poster = art['poster']

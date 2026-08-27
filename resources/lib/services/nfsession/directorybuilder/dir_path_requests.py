@@ -9,6 +9,7 @@
 """
 from typing import TYPE_CHECKING
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from types import SimpleNamespace
 import json
 import re
@@ -83,6 +84,8 @@ BROWSER_LOCO_HOME_ROW_RANGE = {'from': 4, 'to': 50}
 BROWSER_LOCO_HOME_VISIBLE_RANGE = {'from': 0, 'to': 8}
 BROWSER_LOCO_CONTINUE_LAZY_RANGE = {'from': 8, 'to': 100}
 SEARCH_GRAPHQL_PAGE_SIZE = 48
+SEARCH_TITLE_PAGE_METADATA_LIMIT = 24
+SEARCH_TITLE_PAGE_METADATA_WORKERS = 6
 METADATA_REFERENCE_KEYS = {
     'cast': ('people', ('cast', 'actors', 'actor', 'starring', 'starringActors')),
     'directors': ('people', ('directors', 'director')),
@@ -214,19 +217,45 @@ def metadata_with_title_page_fallback(video_id, metadata_video=None):
     metadata_video = dict(metadata_video or {})
     if (_metadata_has_reference_names(metadata_video) and
             _metadata_has_trailer(metadata_video) and
-            _metadata_year(metadata_video)):
+            _metadata_year(metadata_video) and
+            (metadata_video.get('synopsis') or metadata_video.get('regularSynopsis'))):
         return metadata_video
     title_page_metadata = _metadata_from_title_page(video_id)
+    return _merge_title_page_metadata(metadata_video, title_page_metadata)
+
+
+def _merge_title_page_metadata(metadata_video, title_page_metadata):
+    metadata_video = dict(metadata_video or {})
     if not title_page_metadata:
         return metadata_video
     for key in ('actors', 'directors', 'creators', 'genre', 'trailer'):
         if key in title_page_metadata and key not in metadata_video:
             metadata_video[key] = title_page_metadata[key]
+    description = title_page_metadata.get('description')
+    if description and not (metadata_video.get('synopsis') or metadata_video.get('regularSynopsis')):
+        metadata_video['synopsis'] = description
+        metadata_video['regularSynopsis'] = description
     if not _metadata_year(metadata_video):
         title_page_year = _metadata_year(title_page_metadata)
         if title_page_year:
             metadata_video['year'] = title_page_year
     return metadata_video
+
+
+def _search_title_page_metadata(video_id):
+    try:
+        response = requests.get(
+            NETFLIX_TITLE_URL.format(video_id),
+            headers={
+                'Accept': 'text/html,application/xhtml+xml,application/xml',
+                'User-Agent': common.get_user_agent(enable_android_mediaflag_fix=True)
+            },
+            timeout=(2, 4))
+        response.raise_for_status()
+    except req_exceptions.RequestException as exc:
+        LOG.debug('Search title page metadata skipped for {} ({})', video_id, type(exc).__name__)
+        return {}
+    return _title_page_jsonld_data(response.content)
 
 
 def _metadata_trailer_id(metadata_video):
@@ -474,6 +503,30 @@ def _merge_search_metadata_video(base_video, metadata_video):
     return merged
 
 
+def _metadata_video_to_item(video_id, metadata_video):
+    title = metadata_video.get('title') or str(video_id)
+    video_type = str(metadata_video.get('type') or metadata_video.get('videoType') or '').lower()
+    if video_type not in ('movie', 'show'):
+        video_type = 'show' if metadata_video.get('seasons') else 'movie'
+    base_video = {
+        'summary': _summary(str(video_id), title, video_type),
+        'title': _value(title),
+        'availability': _value({'isPlayable': True}),
+        'queue': _value({'inQueue': False}),
+        'inRemindMeList': _value(False),
+        'bookmarkPosition': _value(0),
+        'creditsOffset': _value(0),
+        'watchedToEndOffset': _value(0),
+        'watched': _value(False),
+        'runtime': _value(0),
+        'releaseYear': _value(0),
+        'maturity': _value({}),
+        'trackIds': _value({}),
+        'requestId': _value('')
+    }
+    return _merge_search_metadata_video(base_video, metadata_video)
+
+
 def _metadata_image_url(metadata, keys, portrait):
     candidates = []
 
@@ -538,7 +591,15 @@ def _search_graphql_node_to_item(node):
     }
     artwork = (node.get('contextualArtwork') or {}).get('artwork') or {}
     if artwork.get('url'):
-        _set_browser_boxart(item, {'id': int(video_id), 'title': title, 'boxArt': {'url': artwork['url']}})
+        _set_browser_boxart(item, {
+            'id': int(video_id),
+            'title': title,
+            'boxArt': {
+                'url': artwork['url'],
+                'width': artwork.get('width') or artwork.get('w'),
+                'height': artwork.get('height') or artwork.get('h')
+            }
+        })
     return video_id, item
 
 
@@ -673,6 +734,7 @@ def _title_page_graphql_data(content, react_context):
     graphql_data = graphql_cache.get('data') if isinstance(graphql_cache, dict) else None
     return graphql_data if isinstance(graphql_data, dict) else {}
 
+
 def _normalize_browser_list_lengths(path_response):
     for list_data in path_response.get('lists', {}).values():
         if not isinstance(list_data, dict):
@@ -693,15 +755,33 @@ def _browser_reference_paths(reference_path, include_metadata=False):
     return paths
 
 
+def _boxart_dimensions(boxart):
+    try:
+        width = int(boxart.get('width') or boxart.get('w') or 0)
+        height = int(boxart.get('height') or boxart.get('h') or 0)
+    except (TypeError, ValueError):
+        return 0, 0
+    return width, height
+
+
 def _set_browser_boxart(video, item_summary):
     boxart = item_summary.get('boxArt') or {}
     image_url = boxart.get('url')
-    video.setdefault('itemSummary', _value(item_summary))
+    width, height = _boxart_dimensions(boxart)
+    is_portrait = bool(width and height and height > width)
+    item_summary_value = dict(item_summary)
+    if image_url and not is_portrait:
+        item_summary_value.pop('boxArt', None)
+    video['itemSummary'] = _value(item_summary_value)
     if not image_url:
         return
     art_value = {'url': image_url}
-    video.setdefault('boxarts', {})
-    video['boxarts'].setdefault(ART_SIZE_POSTER, {'jpg': {'value': art_value}})
+    if is_portrait:
+        video.setdefault('boxarts', {})
+        video['boxarts'].setdefault(ART_SIZE_POSTER, {'jpg': {'value': art_value}})
+    else:
+        video.setdefault('interestingMoment', {})
+        video['interestingMoment'].setdefault(ART_SIZE_FHD, {'jpg': {'value': art_value}})
 
 
 def _browser_item_summary_score(item_summary):
@@ -1758,12 +1838,40 @@ class DirectoryPathRequests:
                 if item:
                     video_id, video_data = item
                     videos.setdefault(video_id, video_data)
+        metadata_by_video = OrderedDict()
         for video_id, video_data in list(videos.items()):
-            metadata_video = self._search_metadata_for_video(video_id)
+            metadata_by_video[video_id] = self._search_metadata_for_video(video_id)
+        self._enrich_search_title_page_metadata(metadata_by_video)
+        for video_id, metadata_video in metadata_by_video.items():
             if metadata_video:
-                videos[video_id] = _merge_search_metadata_video(video_data, metadata_video)
+                videos[video_id] = _merge_search_metadata_video(videos[video_id], metadata_video)
+                normalize_metadata_references(path_response, video_id, metadata_video, videos[video_id])
         LOG.debug('GraphQL search returned {} video results for "{}"', len(videos), search_term)
         return CustomVideoList(path_response)
+
+    def _enrich_search_title_page_metadata(self, metadata_by_video):
+        video_ids = [
+            video_id
+            for video_id, metadata_video in metadata_by_video.items()
+            if not _metadata_has_reference_names(metadata_video)
+        ][:SEARCH_TITLE_PAGE_METADATA_LIMIT]
+        if not video_ids:
+            return
+        max_workers = min(SEARCH_TITLE_PAGE_METADATA_WORKERS, len(video_ids))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_by_video_id = {
+                executor.submit(_search_title_page_metadata, video_id): video_id
+                for video_id in video_ids
+            }
+            for future in as_completed(future_by_video_id):
+                video_id = future_by_video_id[future]
+                try:
+                    title_page_metadata = future.result()
+                except Exception as exc:  # pylint: disable=broad-except
+                    LOG.debug('Search title page metadata failed for {} ({})', video_id, type(exc).__name__)
+                    continue
+                metadata_by_video[video_id] = _merge_title_page_metadata(
+                    metadata_by_video.get(video_id), title_page_metadata)
 
     def _search_metadata_for_video(self, video_id):
         try:
@@ -1826,8 +1934,21 @@ class DirectoryPathRequests:
         LOG.debug('Requesting a video list for {} videos', video_ids)
         paths = build_paths(['videos', video_ids],
                             custom_partial_paths if custom_partial_paths else VIDEO_LIST_PARTIAL_PATHS)
-        path_response = self.nfsession.path_request(paths)
-        return CustomVideoList(path_response)
+        try:
+            path_response = self.nfsession.path_request(paths)
+            return CustomVideoList(path_response)
+        except req_exceptions.HTTPError as exc:
+            status_code = getattr(exc.response, 'status_code', None)
+            if status_code not in (404, 412):
+                raise
+            LOG.warn('Falling back to metadata video list for {} videos after pathEvaluator {}',
+                     len(video_ids), status_code)
+        videos = OrderedDict()
+        for video_id in video_ids:
+            metadata_video = self._metadata_for_video(str(video_id), 'Video id list')
+            if metadata_video:
+                videos[str(video_id)] = _metadata_video_to_item(str(video_id), metadata_video)
+        return CustomVideoList({'videos': videos})
 
     @cache_utils.cache_output(cache_utils.CACHE_COMMON, fixed_identifier='lolomo_category',
                               identify_append_from_kwarg_name='category_name', ignore_self_class=True)

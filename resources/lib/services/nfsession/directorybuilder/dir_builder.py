@@ -137,7 +137,9 @@ class DirectoryBuilder(DirectoryPathRequests):
             needs_art = self._needs_metadata_boxart(video)
             needs_refs = include_refs and not _has_reference_entries(video, 'cast')
             needs_year = not common.get_path_safe(['releaseYear', 'value'], video)
-            if not needs_art and not needs_refs and not needs_year:
+            needs_synopsis = not (common.get_path_safe(['synopsis', 'value'], video) or
+                                  common.get_path_safe(['regularSynopsis', 'value'], video))
+            if not needs_art and not needs_refs and not needs_year and not needs_synopsis:
                 continue
             try:
                 videoid = VideoId.from_videolist_item(video)
@@ -146,14 +148,17 @@ class DirectoryBuilder(DirectoryPathRequests):
             if videoid.mediatype not in (VideoId.MOVIE, VideoId.SHOW):
                 continue
             try:
-                metadata = self.nfsession._metadata(videoid)  # pylint: disable=protected-access
+                metadata = self._search_metadata_for_video(videoid.value)
             except Exception as exc:  # pylint: disable=broad-except
                 LOG.debug('Metadata enrichment skipped for {}: {}', videoid, exc)
                 continue
-            if needs_year and not _metadata_year(metadata):
+            if ((needs_year and not _metadata_year(metadata)) or
+                    (needs_synopsis and not self._metadata_synopsis(metadata))):
                 metadata = metadata_with_title_page_fallback(videoid.value, metadata)
             if needs_art:
                 self._apply_metadata_art(video, metadata)
+            if needs_synopsis:
+                self._apply_metadata_synopsis(video, metadata)
             if needs_year:
                 release_year = _metadata_year(metadata)
                 if release_year:
@@ -167,8 +172,7 @@ class DirectoryBuilder(DirectoryPathRequests):
     @staticmethod
     def _needs_metadata_boxart(video):
         poster = common.get_path_safe(['boxarts', ART_SIZE_POSTER, 'jpg', 'value', 'url'], video)
-        fallback = common.get_path_safe(['itemSummary', 'value', 'boxArt', 'url'], video)
-        return not poster and not fallback
+        return not poster
 
     @staticmethod
     def _apply_metadata_art(video, metadata):
@@ -178,6 +182,19 @@ class DirectoryBuilder(DirectoryPathRequests):
         wide_art = DirectoryBuilder._best_metadata_art(metadata, ('artwork', 'interestingMoment'), portrait=False)
         if wide_art:
             video.setdefault('interestingMoment', {})[ART_SIZE_FHD] = {'jpg': {'value': {'url': wide_art}}}
+
+    @staticmethod
+    def _metadata_synopsis(metadata):
+        if not isinstance(metadata, dict):
+            return ''
+        return metadata.get('synopsis') or metadata.get('regularSynopsis') or ''
+
+    @staticmethod
+    def _apply_metadata_synopsis(video, metadata):
+        synopsis = DirectoryBuilder._metadata_synopsis(metadata)
+        if synopsis:
+            video['synopsis'] = {'value': synopsis}
+            video['regularSynopsis'] = {'value': synopsis}
 
     @staticmethod
     def _best_metadata_art(metadata, keys, portrait):
@@ -316,7 +333,11 @@ class DirectoryBuilder(DirectoryPathRequests):
         """Add the specified video ids to a video list datatype in the cache (only if the cache item exists)"""
         try:
             video_list_sorted_data = G.CACHE.get(cache_bucket, cache_identifier)
-            merge_data_type(video_list_sorted_data, self.req_datatype_video_list_byid(video_ids))
+            data_to_merge = self.req_datatype_video_list_byid(video_ids)
+            for video in data_to_merge.videos.values():
+                video.setdefault('queue', {'value': {}})
+                video['queue'].setdefault('value', {})['inQueue'] = True
+            merge_data_type(video_list_sorted_data, data_to_merge)
             G.CACHE.add(cache_bucket, cache_identifier, video_list_sorted_data)
         except CacheMiss:
             pass

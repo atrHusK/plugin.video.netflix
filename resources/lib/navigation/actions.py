@@ -116,9 +116,10 @@ class AddonActionExecutor:
         operation = pathitems[1]
         api.update_my_list(videoid, operation, self.params)
         sync_library(videoid, operation)
-        if operation == 'remove' and common.WndHomeProps[common.WndHomeProps.CURRENT_DIRECTORY_MENU_ID] == 'myList':
+        is_mylist = common.WndHomeProps[common.WndHomeProps.CURRENT_DIRECTORY_MENU_ID] == 'myList'
+        if operation == 'remove' and is_mylist:
             common.json_rpc('Input.Down')  # Avoids selection back to the top
-        common.container_refresh()
+            common.container_refresh()
 
     @common.inject_video_id(path_offset=1)
     def remind_me(self, videoid):

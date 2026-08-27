@@ -214,12 +214,11 @@ def _update_mylist_cache(videoid, operation, params):
         except CacheMiss:
             pass
     else:
-        common.make_call('add_videoids_to_video_list_cache', {'cache_bucket': cache_utils.CACHE_MYLIST,
-                                                              'cache_identifier': mylist_identifier,
-                                                              'video_ids': [videoid.value]})
+        G.CACHE.delete(cache_utils.CACHE_MYLIST, mylist_identifier)
         try:
             my_list_videoids = G.CACHE.get(cache_utils.CACHE_MYLIST, 'my_list_items')
-            my_list_videoids.append(videoid)
+            if videoid not in my_list_videoids:
+                my_list_videoids.append(videoid)
             G.CACHE.add(cache_utils.CACHE_MYLIST, 'my_list_items', my_list_videoids)
         except CacheMiss:
             pass
