@@ -1338,6 +1338,24 @@ def _browser_item_summary_score(item_summary):
     return bool(synopsis), len(synopsis or ''), len(item_summary)
 
 
+def _item_summary_availability(item_summary):
+    """Read whether a title can be played out of the summary the website returns
+
+    The summary of a list carries it under availability, the entities of the
+    GraphQL queries carry it at the top level instead. Only when neither says
+    anything is the title assumed playable, so that a title of a list that
+    answers with fewer fields stays reachable."""
+    availability = item_summary.get('availability')
+    if isinstance(availability, dict) and 'isPlayable' in availability:
+        return availability
+    if 'isPlayable' in item_summary:
+        return {'isPlayable': bool(item_summary['isPlayable']),
+                'unplayableCause': item_summary.get('unplayableCauses')}
+    if isinstance(availability, dict):
+        return availability
+    return {'isPlayable': True}
+
+
 def _normalize_browser_video_fields(path_response):
     _normalize_browser_list_lengths(path_response)
     item_summaries = {}
@@ -1393,7 +1411,7 @@ def _normalize_browser_video_fields(path_response):
         if synopsis:
             video.setdefault('synopsis', _value(synopsis))
             video.setdefault('regularSynopsis', _value(synopsis))
-        video.setdefault('availability', _value(item_summary.get('availability', {'isPlayable': True})))
+        video.setdefault('availability', _value(_item_summary_availability(item_summary)))
         video.setdefault('queue', _value({'inQueue': False}))
         video.setdefault('inRemindMeList', _value(False))
         video.setdefault('bookmarkPosition', _value(0))

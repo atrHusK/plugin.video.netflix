@@ -256,7 +256,8 @@ def _update_remindme_graphql(operation, videoid, trackid):
     if not entity or entity.get('isInRemindMeList') != mutation['expected_state']:
         LOG.debug('update_remindme response: {}', response)
         raise APIError('Unable update remind me, an error occurred in the request.')
-    LOG.info('REMIND ME: the reminder of the title {} was {}ed', videoid.value, operation)
+    LOG.info('REMIND ME: the reminder of the title {} was {}',
+             videoid.value, 'added' if operation == 'add' else 'removed')
     # 05/10/2022: The remove action by using this new callpath not works
     # op = 'addToRemindMeList' if operation == 'add' else 'removeToRemindMeList'
     # call_args = {
