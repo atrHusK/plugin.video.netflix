@@ -16,13 +16,16 @@ import time
 import uuid
 from urllib.parse import urlencode
 
+import requests
 import requests.exceptions as req_exceptions
 
 from resources.lib import common
+from resources.lib.utils import website
 from resources.lib.utils.data_types import (VideoListSorted, SubgenreList, SeasonList, EpisodeList, LoCo, VideoList,
                                             SearchVideoList, CustomVideoList, LoLoMoCategory, VideoListSupplemental,
                                             VideosList)
-from resources.lib.common.exceptions import InvalidVideoListTypeError, InvalidVideoId, MetadataNotAvailable
+from resources.lib.common.exceptions import (InvalidVideoListTypeError, InvalidVideoId, MetadataNotAvailable,
+                                             WebsiteParsingError)
 from resources.lib.database.db_utils import TABLE_SESSION
 from resources.lib.utils.api_paths import (VIDEO_LIST_PARTIAL_PATHS, RANGE_PLACEHOLDER, VIDEO_LIST_BASIC_PARTIAL_PATHS,
                                            SEASONS_PARTIAL_PATHS, EPISODES_PARTIAL_PATHS, ART_PARTIAL_PATHS, ART_SIZE_FHD, ART_SIZE_POSTER, ART_SIZE_SD,
@@ -36,7 +39,10 @@ GRAPHQL_URL = 'https://web.prod.cloud.netflix.com/graphql'
 GRAPHQL_OP_SEASONS = 'dbc3b274-d4f9-4811-aaf1-d082d3b936f2'
 GRAPHQL_OP_EPISODES = '27b30e4e-871d-46aa-ac8b-244103d2e37d'
 GRAPHQL_OP_SEARCH = '8d902979-56f2-4886-8c16-f8910f6b52ee'
+NETFLIX_TITLE_URL = 'https://www.netflix.com/title/{}'
+TITLE_PAGE_GRAPHQL_RE = re.compile(r"netflix\.reactContext\.models\.graphql\s*=\s*JSON\.parse\('(.*?)'\);", re.DOTALL)
 LOCO_ROOT_ID_RE = re.compile(r'NES_[A-Za-z0-9_]+_p_\d+')
+LOCO_ROOT_CANDIDATE_RE = re.compile(r'NES_[A-Za-z0-9_]+')
 LOCO_ROW_RANGE = {'from': 0, 'to': 50}
 LOCO_PAGE_RANGE = {'from': 0, 'to': 20}
 LOCO_REFERENCE_FIELDS = [
@@ -275,6 +281,137 @@ def _search_graphql_node_to_item(node):
         _set_browser_boxart(item, {'id': int(video_id), 'title': title, 'boxArt': {'url': artwork['url']}})
     return video_id, item
 
+
+
+def _graphql_cache_node(graphql_data, typename, video_id):
+    video_id = str(video_id)
+    direct_key = f'{typename}:{{"videoId":{video_id}}}'
+    node = graphql_data.get(direct_key)
+    if isinstance(node, dict):
+        return node
+    key_prefix = f'{typename}:'
+    for key, candidate in graphql_data.items():
+        if not isinstance(candidate, dict):
+            continue
+        if key.startswith(key_prefix) and str(candidate.get('videoId')) == video_id:
+            return candidate
+    return None
+
+
+def _graphql_ref_node(graphql_data, node_or_ref):
+    if not isinstance(node_or_ref, dict):
+        return None
+    ref = node_or_ref.get('__ref')
+    if ref:
+        return graphql_data.get(ref)
+    return node_or_ref
+
+
+def _iter_graphql_edges(value):
+    if isinstance(value, dict) and '__ref' in value:
+        return []
+    edges = value.get('edges') if isinstance(value, dict) else value
+    if isinstance(edges, dict):
+        return edges.values()
+    if isinstance(edges, list):
+        return edges
+    return []
+
+
+def _first_artwork_url(value):
+    if isinstance(value, dict):
+        url = value.get('url')
+        if isinstance(url, str) and url.startswith('http'):
+            return url
+        for nested in value.values():
+            nested_url = _first_artwork_url(nested)
+            if nested_url:
+                return nested_url
+    elif isinstance(value, list):
+        for nested in value:
+            nested_url = _first_artwork_url(nested)
+            if nested_url:
+                return nested_url
+    return ''
+
+
+def _supplemental_artwork_url(node):
+    for key, value in node.items():
+        if 'artwork' not in key.lower():
+            continue
+        image_url = _first_artwork_url(value)
+        if image_url:
+            return image_url
+    return ''
+
+
+def _supplemental_node_to_item(node):
+    video_id = str(node.get('videoId') or node.get('id') or '')
+    if not video_id:
+        return None
+    title = node.get('title') or node.get('displayName') or video_id
+    item = {
+        'summary': _summary(video_id, title, 'movie'),
+        'title': _value(title),
+        'availability': _value({'isPlayable': True}),
+        'queue': _value({'inQueue': False}),
+        'inRemindMeList': _value(False),
+        'bookmarkPosition': _value(0),
+        'creditsOffset': _value(0),
+        'watchedToEndOffset': _value(0),
+        'watched': _value(False),
+        'runtime': _value(node.get('runtimeSec') or node.get('runtime') or 0),
+        'trackIds': _value({'trackId': video_id}),
+        'requestId': _value('')
+    }
+    synopsis = node.get('synopsis') or node.get('contextualSynopsis') or ''
+    if isinstance(synopsis, dict):
+        synopsis = synopsis.get('text') or synopsis.get('value') or ''
+    if synopsis:
+        item['synopsis'] = _value(synopsis)
+        item['regularSynopsis'] = _value(synopsis)
+    image_url = _supplemental_artwork_url(node)
+    if image_url:
+        _set_browser_boxart(item, {'id': int(video_id), 'title': title, 'boxArt': {'url': image_url}})
+    return video_id, item
+
+
+def _supplemental_videos_from_graphql_cache(graphql_data, video_id):
+    if not isinstance(graphql_data, dict):
+        return OrderedDict()
+    title_node = (_graphql_cache_node(graphql_data, 'Show', video_id) or
+                  _graphql_cache_node(graphql_data, 'Movie', video_id))
+    if not isinstance(title_node, dict):
+        return OrderedDict()
+    supplemental_list = title_node.get('supplementalVideosList') or {}
+    supplemental_list = _graphql_ref_node(graphql_data, supplemental_list) or supplemental_list
+    videos = OrderedDict()
+    for edge in _iter_graphql_edges(supplemental_list):
+        edge_node = edge.get('node') if isinstance(edge, dict) else edge
+        supplemental_node = _graphql_ref_node(graphql_data, edge_node)
+        if not isinstance(supplemental_node, dict):
+            continue
+        item = _supplemental_node_to_item(supplemental_node)
+        if item:
+            videos[item[0]] = item[1]
+    return videos
+
+
+def _title_page_graphql_data(content, react_context):
+    graphql_data = common.get_path_safe(['models', 'graphql', 'data'], react_context, False, {})
+    if isinstance(graphql_data, dict) and graphql_data:
+        return graphql_data
+    html = content.decode('utf-8', 'replace') if isinstance(content, bytes) else str(content)
+    match = TITLE_PAGE_GRAPHQL_RE.search(html)
+    if not match:
+        return {}
+    try:
+        graphql_cache = json.loads(match.group(1).encode().decode('unicode_escape'))
+    except (TypeError, ValueError, UnicodeDecodeError) as exc:
+        LOG.warn('Unable to parse title page GraphQL cache ({})', type(exc).__name__)
+        return {}
+    graphql_data = graphql_cache.get('data') if isinstance(graphql_cache, dict) else None
+    return graphql_data if isinstance(graphql_data, dict) else {}
 
 def _normalize_browser_list_lengths(path_response):
     for list_data in path_response.get('lists', {}).values():
@@ -606,9 +743,34 @@ class DirectoryPathRequests:
     def _get_current_loco_root_id(self):
         browse_html, auth_url = self._browse_html_and_auth_url()
         match = LOCO_ROOT_ID_RE.search(browse_html)
-        if not match:
+        if match:
+            return match.group(0), auth_url
+        root_id = self._probe_current_loco_root_id(self._loco_root_candidates(browse_html), auth_url)
+        if not root_id:
             raise InvalidVideoListTypeError('No current LoCo root id found in browse page')
-        return match.group(0), auth_url
+        return root_id, auth_url
+
+    def _loco_root_candidates(self, browse_html):
+        seen = set()
+        for match in LOCO_ROOT_CANDIDATE_RE.finditer(browse_html):
+            candidate = match.group(0)
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            yield candidate
+
+    def _probe_current_loco_root_id(self, candidates, auth_url):
+        for candidate in candidates:
+            try:
+                path_response = self._post_current_loco_paths(
+                    [['locos', candidate, 'componentSummary']], auth_url)
+            except req_exceptions.RequestException:
+                continue
+            root_data = path_response.get('locos', {}).get(candidate)
+            if isinstance(root_data, dict) and root_data.get('componentSummary', {}).get('value'):
+                LOG.warn('Using probed current LoCo root candidate from browse page')
+                return candidate
+        return None
 
     def _current_loco_paths(self, root_id):
         return ([
@@ -749,7 +911,10 @@ class DirectoryPathRequests:
         return None
 
     def _browser_continue_watching_list(self):
-        root_id, auth_url = self._get_current_loco_root_id()
+        try:
+            root_id, auth_url = self._get_current_loco_root_id()
+        except InvalidVideoListTypeError:
+            return self._browser_continue_watching_genre_fallback()
         root_response = self._browser_continue_watching_loco_response(
             root_id, auth_url, BROWSER_LOCO_HOME_ROW_RANGE)
         list_id = self._continue_watching_list_id(root_response)
@@ -772,6 +937,22 @@ class DirectoryPathRequests:
             root_response.setdefault('videos', {}).update(lazy_response.get('videos', {}))
             _normalize_browser_video_fields(root_response)
         return VideoList(root_response, str(list_id))
+
+    def _browser_continue_watching_genre_fallback(self):
+        LOG.warn('Home LoCo discovery failed for Continue Watching; using genre fallback')
+        try:
+            loco_list = self.req_loco_list_genre('1592210')
+            for list_id, video_list in loco_list.lists.items():
+                if video_list.get('context') != 'continueWatching':
+                    continue
+                try:
+                    return self._browser_genre_video_list_by_id('1592210', list_id)
+                except Exception:  # pylint: disable=broad-except
+                    LOG.warn('Using materialized Continue Watching genre row after browser list lookup failed')
+                    return video_list
+        except Exception:  # pylint: disable=broad-except
+            LOG.warn('Continue Watching genre fallback failed after home LoCo discovery failure')
+        return CustomVideoList({'videos': {}})
 
     def _first_loco_video_list(self, loco):
         for _list_id, video_list in loco.lists.items():
@@ -942,70 +1123,42 @@ class DirectoryPathRequests:
                 contained_titles=[],
                 component_summary={})
 
-        def _similars_fallback():
+        def _title_page_fallback():
             try:
-                path_response = self.nfsession.path_request(
-                    [['videos', int(videoid.value), 'similars', {'from': 0, 'to': 35}, 'summary']])
-            except req_exceptions.HTTPError as exc:
-                if getattr(exc.response, 'status_code', None) != 404:
-                    raise
-                LOG.warn('Similar-title fallback returned 404 for {}', videoid)
+                response = requests.get(
+                    NETFLIX_TITLE_URL.format(videoid.value),
+                    headers={
+                        'Accept': 'text/html,application/xhtml+xml,application/xml',
+                        'User-Agent': common.get_user_agent(enable_android_mediaflag_fix=True)
+                    },
+                    timeout=8)
+                response.raise_for_status()
+                react_context = website.extract_json(response.content, 'reactContext')
+            except (req_exceptions.RequestException, WebsiteParsingError) as exc:
+                LOG.warn('Title page trailer fallback failed for {} ({})', videoid, type(exc).__name__)
                 return _empty_fallback()
-            similar_items = common.get_path_safe(['videos', videoid.value, 'similars'], path_response, None, {})
-            videos = OrderedDict()
-            if isinstance(similar_items, dict):
-                iterable_items = similar_items.values()
-            else:
-                iterable_items = similar_items if isinstance(similar_items, list) else []
-            for item in iterable_items:
-                summary = item.get('value') if isinstance(item, dict) else None
-                if not isinstance(summary, dict) or not summary.get('id'):
-                    continue
-                item_id = str(summary['id'])
-                title = summary.get('name') or summary.get('title') or item_id
-                videos[item_id] = {
-                    'title': _value(title),
-                    'summary': _value(summary),
-                    'availability': _value({'isPlayable': True}),
-                    'trackIds': _value({})
-                }
-                metadata_video = self._metadata_for_search_video(item_id)
-                if metadata_video:
-                    videos[item_id] = _merge_search_metadata_video(videos[item_id], metadata_video)
-            return CustomVideoList({'videos': videos}) if videos else _empty_fallback()
-
-        def _promo_fallback():
-            metadata = self.nfsession.get_safe(endpoint='metadata', params={'movieid': videoid.value, '_': int(time.time() * 1000)})
-            trailer_id = common.get_path_safe(['video', 'promoVideo', 'value', 'id'], metadata, None)
-            if not trailer_id:
-                trailer_id = common.get_path_safe(['video', 'merchedVideoId'], metadata, None)
-            if not trailer_id:
-                LOG.warn('No promo trailer id found for {}, trying similar-title fallback', videoid)
-                return _similars_fallback()
-            title = common.get_path_safe(['video', 'title'], metadata, 'Trailer')
-            return SimpleNamespace(
-                perpetual_range_selector=None,
-                videos=OrderedDict({str(trailer_id): {
-                    'title': {'value': title},
-                    'availability': {'value': {'isPlayable': True}},
-                    'summary': {'value': {'id': int(trailer_id), 'type': 'movie', 'name': title}},
-                    'trackIds': {'value': {'trackId': str(trailer_id)}}
-                }}),
-                artitem=None,
-                contained_titles=[title],
-                component_summary={})
+            graphql_data = _title_page_graphql_data(response.content, react_context)
+            videos = _supplemental_videos_from_graphql_cache(graphql_data, videoid.value)
+            if videos:
+                LOG.debug('Title page trailer fallback found {} supplemental videos for {}', len(videos), videoid)
+                trailer_list = CustomVideoList({'videos': videos})
+                trailer_list.is_supplemental_type = True
+                trailer_list.component_summary = {}
+                return trailer_list
+            LOG.warn('No title page supplemental videos found for {}', videoid)
+            return _empty_fallback()
         try:
             path_response = self.nfsession.path_request(path)
             trailer_list = VideoListSupplemental(path_response, 'videos', videoid.value, supplemental_type)
             if trailer_list.videos:
                 return trailer_list
-            LOG.warn('Trailer supplemental response was empty for {}, trying promoVideo fallback', videoid)
-            return _promo_fallback()
+            LOG.warn('Trailer supplemental response was empty for {}, trying title page fallback', videoid)
+            return _title_page_fallback()
         except req_exceptions.HTTPError as exc:
             if getattr(exc.response, 'status_code', None) != 404:
                 raise
-            LOG.warn('Trailer supplemental path returned 404 for {}, trying promoVideo fallback', videoid)
-            return _promo_fallback()
+            LOG.warn('Trailer supplemental path returned 404 for {}, trying title page fallback', videoid)
+            return _title_page_fallback()
 
     @cache_utils.cache_output(cache_utils.CACHE_COMMON, identify_from_kwarg_name='chunked_video_list',
                               ttl=900, ignore_self_class=True)

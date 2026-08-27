@@ -273,7 +273,8 @@ def build_video_listing(video_list, menu_data, sub_genre_id=None, pathitems=None
         'active_profile_guid': G.LOCAL_DB.get_active_profile_guid(),
         'marks_tvshow_started': G.ADDON.getSettingBool('marks_tvshow_started'),
         'trackid': trackid,
-        'is_supplemental_type': video_list.__class__.__name__ == 'VideoListSupplemental'
+        'is_supplemental_type': (getattr(video_list, 'is_supplemental_type', False) or
+                                 video_list.__class__.__name__ == 'VideoListSupplemental')
     })
     directory_items = [_create_video_item(videoid_value, video, video_list, perpetual_range_start, common_data)
                        for videoid_value, video
