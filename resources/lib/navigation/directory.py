@@ -244,17 +244,26 @@ class Directory:
         dir_items, extra_data = common.make_call('get_video_list_supplemental', call_args)
         if not dir_items:
             videoid = common.VideoId.from_dict(call_args['video_id_dict'])
-            infos, art = common.make_call('get_videoid_info', videoid)
-            if infos.get('Trailer', '').startswith('http'):
-                title = infos.get('Title') or common.get_local_string(30179)
-                list_item = xbmcgui.ListItem(title, offscreen=True)
-                infos['Title'] = title
+            direct_trailer = common.make_call('get_direct_trailer', videoid) or {}
+            trailer_url = direct_trailer.get('url', '')
+            if trailer_url:
+                title = direct_trailer.get('title') or common.get_local_string(30179)
+                list_item = xbmcgui.ListItem(title, path=trailer_url, offscreen=True)
+                infos = {'Title': title}
+                if direct_trailer.get('synopsis'):
+                    infos['Plot'] = direct_trailer['synopsis']
+                    infos['PlotOutline'] = direct_trailer['synopsis']
+                if direct_trailer.get('year'):
+                    infos['Year'] = direct_trailer['year']
                 list_item.setInfo('video', infos)
-                list_item.setArt(art)
+                if direct_trailer.get('poster'):
+                    list_item.setArt({
+                        'poster': direct_trailer['poster'],
+                        'thumb': direct_trailer['poster']
+                    })
                 list_item.setProperty('isPlayable', 'true')
                 list_item.setContentLookup(False)
-                play_url = common.build_url(['play_direct_trailer'], videoid=videoid, mode=G.MODE_ACTION)
-                dir_items = [(play_url, list_item, False)]
+                dir_items = [(trailer_url, list_item, False)]
 
         finalize_directory(dir_items, menu_data.get('content_type', G.CONTENT_SHOW),
                            title=get_title(menu_data, extra_data))

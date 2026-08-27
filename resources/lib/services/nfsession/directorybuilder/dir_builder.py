@@ -88,9 +88,11 @@ class DirectoryBuilder(DirectoryPathRequests):
     @measure_exec_time_decorator(is_immediate=True)
     def get_video_list(self, list_id, menu_data, is_dynamic_id):
         menu_id = menu_data['path'][1]
-        cache_enriched_list = (
+        defer_title_details = (
             is_dynamic_id
-            and menu_data.get('initial_menu_id') == 'newAndPopular'
+            and menu_data.get('initial_menu_id') == 'newAndPopular')
+        cache_enriched_list = (
+            (defer_title_details or (not is_dynamic_id and menu_id == 'chosenForYou'))
             and not menu_data.get('no_use_cache'))
         enriched_cache_id = f'enriched_video_list_{list_id}'
         video_list = None
@@ -100,13 +102,14 @@ class DirectoryBuilder(DirectoryPathRequests):
             except CacheMiss:
                 pass
         current_contexts = {
-            'chosenForYou': ('windowedNewReleases',),
             'currentTitles': ('windowedNewReleases',),
             'mostViewed': ('mostWatched',)
         }
         if video_list is None:
             if not is_dynamic_id and menu_id == 'continueWatching':
                 video_list = self._browser_continue_watching_list()
+            elif not is_dynamic_id and menu_id == 'chosenForYou':
+                video_list = self._browser_top_picks_list()
             elif not is_dynamic_id and menu_id in current_contexts:
                 video_list = self._video_list_from_lolomo_category_context(
                     'comingSoon', current_contexts[menu_id], fallback_first=True)
@@ -117,7 +120,14 @@ class DirectoryBuilder(DirectoryPathRequests):
                 video_list = self.req_video_list(
                     list_id, menu_data=menu_data, no_use_cache=menu_data.get('no_use_cache'))
             if menu_id != 'continueWatching':
-                self._enrich_video_list_art(video_list, include_refs=True)
+                # New & Popular rows can contain dozens of titles. The browser
+                # response already supplies each title and contextual artwork,
+                # so block only on repairing genuinely missing posters instead
+                # of risking the 20-second directory timeout.
+                self._enrich_video_list_art(
+                    video_list,
+                    include_refs=not defer_title_details,
+                    art_only=defer_title_details)
             if cache_enriched_list:
                 G.CACHE.add(CACHE_COMMON, enriched_cache_id, video_list)
         return build_video_listing(video_list, menu_data,
@@ -149,7 +159,7 @@ class DirectoryBuilder(DirectoryPathRequests):
         return build_video_listing(video_list, menu_data, sub_genre_id, pathitems, perpetual_range_start,
                                    self.req_mylist_items())
 
-    def _enrich_video_list_art(self, video_list, include_refs=False):
+    def _enrich_video_list_art(self, video_list, include_refs=False, art_only=False):
         if not getattr(video_list, 'videos', None):
             return video_list
         pending = []
@@ -158,9 +168,11 @@ class DirectoryBuilder(DirectoryPathRequests):
                 continue
             needs_art = self._needs_metadata_boxart(video)
             needs_refs = include_refs and not _has_reference_entries(video, 'cast')
-            needs_year = not common.get_path_safe(['releaseYear', 'value'], video)
-            needs_synopsis = not (common.get_path_safe(['synopsis', 'value'], video) or
-                                  common.get_path_safe(['regularSynopsis', 'value'], video))
+            needs_year = (not art_only and
+                          not common.get_path_safe(['releaseYear', 'value'], video))
+            needs_synopsis = (not art_only and
+                              not (common.get_path_safe(['synopsis', 'value'], video) or
+                                   common.get_path_safe(['regularSynopsis', 'value'], video)))
             if not needs_art and not needs_refs and not needs_year and not needs_synopsis:
                 continue
             try:
@@ -187,9 +199,10 @@ class DirectoryBuilder(DirectoryPathRequests):
             except Exception as exc:  # pylint: disable=broad-except
                 LOG.debug('Metadata enrichment skipped for {}: {}', videoid, exc)
                 metadata = {}
-            if ((needs_refs and not _metadata_has_reference_names(metadata)) or
-                    (needs_year and not _metadata_year(metadata)) or
-                    (needs_synopsis and not self._metadata_synopsis(metadata))):
+            if (not art_only and
+                    ((needs_refs and not _metadata_has_reference_names(metadata)) or
+                     (needs_year and not _metadata_year(metadata)) or
+                     (needs_synopsis and not self._metadata_synopsis(metadata)))):
                 metadata = metadata_with_title_page_fallback(videoid.value, metadata)
             return item, metadata
 

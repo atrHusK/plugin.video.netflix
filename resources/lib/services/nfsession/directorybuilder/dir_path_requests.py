@@ -45,6 +45,7 @@ GRAPHQL_OP_SEARCH = '8d902979-56f2-4886-8c16-f8910f6b52ee'
 GRAPHQL_OP_CAROUSEL_PAGE = 'cbe70fd8-c3a1-4e1b-9ab3-d690850ad7f3'
 GRAPHQL_OP_DETAIL_MODAL = '7265187b-c065-4714-9eee-327751c8e215'
 GRAPHQL_OP_DETAIL_MODAL_TRAILERS = '06e30ee5-7983-4fef-8135-5914124b76ad'
+TOP_PICKS_SECTION_LABEL = 'top picks'
 NETFLIX_TITLE_URL = 'https://www.netflix.com/title/{}'
 TITLE_PAGE_GRAPHQL_RE = re.compile(r"netflix\.reactContext\.models\.graphql\s*=\s*JSON\.parse\('(.*?)'\);", re.DOTALL)
 TITLE_PAGE_JSONLD_RE = re.compile(
@@ -741,7 +742,10 @@ def _supplemental_artwork_url(node):
 
 def _supplemental_node_to_item(node):
     video_id = str(node.get('videoId') or node.get('id') or '')
-    if not video_id:
+    # DetailModalTrailers is authoritative for collection playability. Do not
+    # turn an explicitly unplayable (or incomplete) card into a playable Kodi
+    # item merely because it has a video id.
+    if not video_id or node.get('isPlayable') is not True:
         return None
     title = node.get('title') or node.get('displayName') or video_id
     item = {
@@ -758,8 +762,6 @@ def _supplemental_node_to_item(node):
         'trackIds': _value({'trackId': video_id}),
         'requestId': _value('')
     }
-    if node.get('isPlayable') is not None:
-        item['availability'] = _value({'isPlayable': bool(node.get('isPlayable'))})
     synopsis = node.get('synopsis') or node.get('contextualSynopsis') or ''
     if isinstance(synopsis, dict):
         synopsis = synopsis.get('text') or synopsis.get('value') or ''
@@ -1554,20 +1556,8 @@ class DirectoryPathRequests:
             return self._browser_continue_watching_genre_fallback()
 
     def _browser_continue_watching_graphql_list(self):
-        browse_html = self.nfsession.get_safe('browse')
-        api_data = self.nfsession.website_extract_session_data(browse_html)
-        self.nfsession.auth_url = api_data['auth_url']
-        react_context = website.extract_json(browse_html, 'reactContext')
-        graphql_data = _title_page_graphql_data(browse_html, react_context)
-        try:
-            section, connection = self._continue_watching_graphql_section(graphql_data)
-        except InvalidVideoListTypeError:
-            browse_html = self._active_profile_browse_html(browse_html)
-            api_data = self.nfsession.website_extract_session_data(browse_html)
-            self.nfsession.auth_url = api_data['auth_url']
-            react_context = website.extract_json(browse_html, 'reactContext')
-            graphql_data = _title_page_graphql_data(browse_html, react_context)
-            section, connection = self._continue_watching_graphql_section(graphql_data)
+        graphql_data, section, connection = self._browser_graphql_carousel_section(
+            self._continue_watching_graphql_section)
         videos = OrderedDict()
         self._append_continue_watching_graphql_edges(
             videos, graphql_data, _iter_graphql_edges(connection))
@@ -1588,6 +1578,38 @@ class DirectoryPathRequests:
         if not videos:
             raise InvalidVideoListTypeError('No GraphQL Continue Watching videos available')
         return CustomVideoList({'videos': videos})
+
+    def _browser_top_picks_list(self):
+        """Return the personalized Top Picks carousel from the active home page."""
+        graphql_data, _section, connection = self._browser_graphql_carousel_section(
+            self._top_picks_graphql_section)
+        videos = OrderedDict()
+        self._append_standard_graphql_edges(
+            videos, graphql_data, _iter_graphql_edges(connection))
+        if not videos:
+            raise InvalidVideoListTypeError('No GraphQL Top Picks videos available')
+        LOG.debug('GraphQL Top Picks returned {} personalized videos', len(videos))
+        return CustomVideoList({'videos': videos})
+
+    def _browser_graphql_carousel_section(self, section_resolver):
+        browse_html = self.nfsession.get_safe('browse')
+        graphql_data = self._browser_graphql_data(browse_html)
+        try:
+            section, connection = section_resolver(graphql_data)
+        except InvalidVideoListTypeError as section_error:
+            try:
+                browse_html = self._active_profile_browse_html(browse_html)
+            except InvalidVideoListTypeError:
+                raise section_error
+            graphql_data = self._browser_graphql_data(browse_html)
+            section, connection = section_resolver(graphql_data)
+        return graphql_data, section, connection
+
+    def _browser_graphql_data(self, browse_html):
+        api_data = self.nfsession.website_extract_session_data(browse_html)
+        self.nfsession.auth_url = api_data['auth_url']
+        react_context = website.extract_json(browse_html, 'reactContext')
+        return _title_page_graphql_data(browse_html, react_context)
 
     def _active_profile_browse_html(self, profile_gate_html):
         parser = _ActiveProfileLinkParser(G.LOCAL_DB.get_active_profile_guid())
@@ -1620,6 +1642,23 @@ class DirectoryPathRequests:
                 if isinstance(node, dict) and node.get('__typename') == 'PinotContinueWatchingEntityTreatment':
                     return section, connection
         raise InvalidVideoListTypeError('No GraphQL Continue Watching section available')
+
+    @staticmethod
+    def _top_picks_graphql_section(graphql_data):
+        labels = {
+            TOP_PICKS_SECTION_LABEL,
+            str(common.get_local_string(30169) or '').casefold()
+        }
+        for section in graphql_data.values():
+            if not isinstance(section, dict) or section.get('__typename') != 'PinotCarouselSection':
+                continue
+            label = str(section.get('displayString') or '').casefold()
+            if not any(candidate and candidate in label for candidate in labels):
+                continue
+            connection = _graphql_ref_node(graphql_data, section.get('entities'))
+            if isinstance(connection, dict):
+                return section, connection
+        raise InvalidVideoListTypeError('No personalized GraphQL Top Picks section available')
 
     @staticmethod
     def _continue_watching_graphql_node(graphql_data, edge):
@@ -1663,6 +1702,15 @@ class DirectoryPathRequests:
             item['bookmarkPosition'] = _value(bookmark.get('position', 0))
             item['runtime'] = _value(progress_entity.get('runtimeSec') or entity.get('runtimeSec') or 0)
             videos[video_id] = item
+
+    def _append_standard_graphql_edges(self, videos, graphql_data, edges):
+        for edge in edges:
+            node = self._continue_watching_graphql_node(graphql_data, edge)
+            item_data = _search_graphql_node_to_item(node or {})
+            if not item_data:
+                continue
+            video_id, item = item_data
+            videos.setdefault(video_id, item)
 
     def _browser_continue_watching_loco_list(self):
         try:

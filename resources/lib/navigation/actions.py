@@ -209,14 +209,11 @@ class AddonActionExecutor:
     @staticmethod
     def _direct_trailer_url(videoid):
         try:
-            infos, _art = common.make_call('get_videoid_info', videoid)
+            direct_trailer = common.make_call('get_direct_trailer', videoid) or {}
         except Exception as exc:  # pylint: disable=broad-except
             LOG.warn('Trailer info lookup failed for {}: {}', videoid, exc)
             return ''
-        trailer_url = infos.get('Trailer', '')
-        if trailer_url.startswith('http'):
-            return trailer_url
-        return ''
+        return direct_trailer.get('url', '')
 
     @measure_exec_time_decorator()
     def purge_cache(self, pathitems=None):  # pylint: disable=unused-argument

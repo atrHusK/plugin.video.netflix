@@ -10,6 +10,7 @@
 import time
 from datetime import datetime, timedelta
 
+import requests
 import requests.exceptions as req_exceptions
 import xbmc
 
@@ -18,16 +19,40 @@ import resources.lib.utils.website as website
 from resources.lib.common import cache_utils
 from resources.lib.common.exceptions import (NotLoggedInError, MissingCredentialsError, WebsiteParsingError,
                                              MbrStatusAnonymousError, MetadataNotAvailable, LoginValidateError,
-                                             InvalidProfilesError, ErrorMsgNoReport)
+                                             InvalidProfilesError, ErrorMsgNoReport, CacheMiss)
 from resources.lib.globals import G
 from resources.lib.kodi import ui
-from resources.lib.services.nfsession.directorybuilder.dir_path_requests import (metadata_with_title_page_fallback,
+from resources.lib.services.nfsession.directorybuilder.dir_path_requests import (_metadata_image_url,
+                                                                                _metadata_trailer_url,
+                                                                                metadata_with_title_page_fallback,
                                                                                 normalize_metadata_references)
 from resources.lib.services.nfsession.session.path_requests import SessionPathRequests
 from resources.lib.utils import cookies
 from resources.lib.utils.api_paths import (EPISODES_PARTIAL_PATHS, ART_PARTIAL_PATHS, build_paths,
                                            VIDEO_LIST_PARTIAL_PATHS, ART_SIZE_FHD, ART_SIZE_POSTER)
 from resources.lib.utils.logging import LOG, measure_exec_time_decorator
+
+
+def _is_playable_direct_trailer_url(trailer_url):
+    """Require the direct fallback to resolve to actual video content."""
+    if not isinstance(trailer_url, str) or not trailer_url.startswith('http'):
+        return False
+    try:
+        response = requests.get(
+            trailer_url,
+            headers={
+                'Range': 'bytes=0-0',
+                'User-Agent': common.get_user_agent(enable_android_mediaflag_fix=True)
+            },
+            stream=True,
+            timeout=(2, 4))
+        try:
+            content_type = (response.headers.get('content-type') or '').lower()
+            return response.status_code in (200, 206) and content_type.startswith('video/')
+        finally:
+            response.close()
+    except req_exceptions.RequestException:
+        return False
 
 
 class NFSessionOperations(SessionPathRequests):
@@ -51,7 +76,8 @@ class NFSessionOperations(SessionPathRequests):
             self.activate_profile,
             self.parental_control_data,
             self.get_metadata,
-            self.get_videoid_info
+            self.get_videoid_info,
+            self.get_direct_trailer
         ]
         # Share the activate profile function to SessionBase class
         self.external_func_activate_profile = self.activate_profile
@@ -187,6 +213,42 @@ class NFSessionOperations(SessionPathRequests):
             metadata_data = self._metadata(video_id=parent_videoid), None
         return metadata_data
 
+    def get_direct_trailer(self, videoid):
+        """Return a fresh, verified public trailer fallback for a title."""
+        cache_identifier = f'direct_trailer_{videoid}'
+        try:
+            return G.CACHE.get(cache_utils.CACHE_SUPPLEMENTAL, cache_identifier)
+        except CacheMiss:
+            pass
+        try:
+            metadata_data = self.get_safe(
+                endpoint='metadata',
+                params={'movieid': videoid.value, '_': int(time.time() * 1000)})
+            metadata_video = metadata_with_title_page_fallback(
+                videoid.value, metadata_data.get('video') or {})
+        except (MetadataNotAvailable, AttributeError, KeyError, TypeError, req_exceptions.RequestException):
+            result = {}
+            G.CACHE.add(cache_utils.CACHE_SUPPLEMENTAL, cache_identifier, result)
+            return result
+        trailer_url = _metadata_trailer_url(metadata_video)
+        if not _is_playable_direct_trailer_url(trailer_url):
+            result = {}
+            G.CACHE.add(cache_utils.CACHE_SUPPLEMENTAL, cache_identifier, result)
+            return result
+        trailer_data = metadata_video.get('trailer') or {}
+        trailer_title = trailer_data.get('name') if isinstance(trailer_data, dict) else ''
+        poster = _metadata_image_url(
+            metadata_video, ('boxart', 'boxArt', 'boxarts'), portrait=True)
+        result = {
+            'url': trailer_url,
+            'title': trailer_title or metadata_video.get('title') or '',
+            'synopsis': metadata_video.get('synopsis') or metadata_video.get('regularSynopsis') or '',
+            'year': metadata_video.get('year') or metadata_video.get('releaseYear') or 0,
+            'poster': poster
+        }
+        G.CACHE.add(cache_utils.CACHE_SUPPLEMENTAL, cache_identifier, result)
+        return result
+
     def _episode_metadata(self, episode_videoid, tvshow_videoid, refresh_cache=False):
         if refresh_cache:
             G.CACHE.delete(cache_utils.CACHE_METADATA, str(tvshow_videoid))
@@ -256,7 +318,8 @@ class NFSessionOperations(SessionPathRequests):
             pass
         if videoid.mediatype == common.VideoId.EPISODE:
             paths = (build_paths(['videos', int(videoid.value)], EPISODES_PARTIAL_PATHS) +
-                     build_paths(['videos', int(videoid.tvshowid)], ART_PARTIAL_PATHS + [[['title', 'delivery']]]))
+                     build_paths(['videos', int(videoid.tvshowid)],
+                                 ART_PARTIAL_PATHS + [[['title', 'delivery']]]))
         else:
             paths = build_paths(['videos', int(videoid.value)], VIDEO_LIST_PARTIAL_PATHS)
         try:
