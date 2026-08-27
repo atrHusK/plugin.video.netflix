@@ -224,6 +224,11 @@ def build_loco_listing(loco_list, menu_data, force_use_videolist_id=False):
         sub_menu_data['force_use_videolist_id'] = force_use_videolist_id
         sub_menu_data['title'] = video_list['displayName']
         sub_menu_data['initial_menu_id'] = menu_data.get('initial_menu_id', menu_data['path'][1])
+        if menu_data.get('path', [None])[0] == 'genres' and len(menu_data['path']) > 2:
+            sub_menu_data['browser_genre_id'] = (
+                str(video_list['genreId'])
+                if video_list['context'] == 'genre'
+                else str(menu_data['path'][2]))
         # Do not use the cache with 'Top 10' menus, so that you always get up-to-date data.
         sub_menu_data['no_use_cache'] = video_list['context'] == 'mostWatched'
         G.LOCAL_DB.set_value(list_id, sub_menu_data, TABLE_MENU_DATA)

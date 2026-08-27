@@ -10,12 +10,13 @@
 from typing import TYPE_CHECKING
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from html.parser import HTMLParser
 from types import SimpleNamespace
 import json
 import re
 import time
 import uuid
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin
 
 import requests
 import requests.exceptions as req_exceptions
@@ -23,7 +24,7 @@ import requests.exceptions as req_exceptions
 from resources.lib import common
 from resources.lib.utils import website
 from resources.lib.utils.data_types import (VideoListSorted, SubgenreList, SeasonList, EpisodeList, LoCo, VideoList,
-                                            SearchVideoList, CustomVideoList, LoLoMoCategory, VideoListSupplemental,
+                                            CustomVideoList, LoLoMoCategory, VideoListSupplemental,
                                             VideosList)
 from resources.lib.common.exceptions import (InvalidVideoListTypeError, InvalidVideoId, MetadataNotAvailable,
                                              WebsiteParsingError)
@@ -31,8 +32,7 @@ from resources.lib.database.db_utils import TABLE_SESSION
 from resources.lib.utils.api_paths import (VIDEO_LIST_PARTIAL_PATHS, RANGE_PLACEHOLDER, VIDEO_LIST_BASIC_PARTIAL_PATHS,
                                            SEASONS_PARTIAL_PATHS, EPISODES_PARTIAL_PATHS, ART_PARTIAL_PATHS,
                                            ART_SIZE_FHD, ART_SIZE_POSTER, TRAILER_PARTIAL_PATHS,
-                                           PATH_REQUEST_SIZE_STD, build_paths,
-                                           PATH_REQUEST_SIZE_MAX)
+                                           build_paths, PATH_REQUEST_SIZE_MAX)
 from resources.lib.common import cache_utils
 from resources.lib.globals import G
 from resources.lib.utils.logging import LOG
@@ -41,6 +41,7 @@ GRAPHQL_URL = 'https://web.prod.cloud.netflix.com/graphql'
 GRAPHQL_OP_SEASONS = 'dbc3b274-d4f9-4811-aaf1-d082d3b936f2'
 GRAPHQL_OP_EPISODES = '27b30e4e-871d-46aa-ac8b-244103d2e37d'
 GRAPHQL_OP_SEARCH = '8d902979-56f2-4886-8c16-f8910f6b52ee'
+GRAPHQL_OP_CAROUSEL_PAGE = 'cbe70fd8-c3a1-4e1b-9ab3-d690850ad7f3'
 NETFLIX_TITLE_URL = 'https://www.netflix.com/title/{}'
 TITLE_PAGE_GRAPHQL_RE = re.compile(r"netflix\.reactContext\.models\.graphql\s*=\s*JSON\.parse\('(.*?)'\);", re.DOTALL)
 TITLE_PAGE_JSONLD_RE = re.compile(
@@ -83,15 +84,39 @@ BROWSER_LOCO_DIRECT_RANGE = {'from': 0, 'to': PATH_REQUEST_SIZE_MAX}
 BROWSER_LOCO_HOME_ROW_RANGE = {'from': 4, 'to': 50}
 BROWSER_LOCO_HOME_VISIBLE_RANGE = {'from': 0, 'to': 8}
 BROWSER_LOCO_CONTINUE_LAZY_RANGE = {'from': 8, 'to': 100}
+BROWSER_MYLIST_RANGE = {'from': 0, 'to': 48}
+BROWSER_MYLIST_FIELDS = [
+    'availability', 'episodeCount', 'inRemindMeList', 'itemSummary',
+    'queue', 'summary'
+]
 SEARCH_GRAPHQL_PAGE_SIZE = 48
-SEARCH_TITLE_PAGE_METADATA_LIMIT = 24
-SEARCH_TITLE_PAGE_METADATA_WORKERS = 6
+SEARCH_TITLE_PAGE_METADATA_LIMIT = SEARCH_GRAPHQL_PAGE_SIZE
+SEARCH_TITLE_PAGE_METADATA_WORKERS = 12
 METADATA_REFERENCE_KEYS = {
     'cast': ('people', ('cast', 'actors', 'actor', 'starring', 'starringActors')),
     'directors': ('people', ('directors', 'director')),
     'creators': ('people', ('creators', 'creator', 'writers', 'writer')),
     'genres': ('genres', ('genres', 'genre', 'tags'))
 }
+
+
+class _ActiveProfileLinkParser(HTMLParser):
+    """Find the profile switch link without exposing its token in logs."""
+
+    def __init__(self, active_profile_guid):
+        super().__init__(convert_charrefs=True)
+        self.active_profile_guid = str(active_profile_guid or '').lower()
+        self.href = None
+
+    def handle_starttag(self, tag, attrs):
+        if self.href or tag != 'a' or not self.active_profile_guid:
+            return
+        attributes = dict(attrs)
+        href = attributes.get('href') or ''
+        classes = (attributes.get('class') or '').split()
+        if self.active_profile_guid in href.lower() and (
+                'profile-link' in classes or '/switchprofile' in href.lower()):
+            self.href = href
 
 
 def _value(value):
@@ -551,16 +576,18 @@ def _metadata_image_url(metadata, keys, portrait):
                 _collect(nested_value)
 
     for key in keys:
-        _collect(metadata.get(key))
+        _collect(metadata.get(key) if isinstance(metadata, dict) else None)
     if not candidates:
         return ''
-
-    def _score(candidate):
-        _url, width, height = candidate
-        matches_orientation = height > width if portrait else width >= height
-        return int(matches_orientation), width * height
-
-    return max(candidates, key=_score)[0]
+    matching = [
+        candidate for candidate in candidates
+        if candidate[1] and candidate[2] and
+        ((candidate[2] > candidate[1]) if portrait else (candidate[1] > candidate[2]))
+    ]
+    if matching:
+        return max(matching, key=lambda candidate: candidate[1] * candidate[2])[0]
+    unknown_size = [candidate for candidate in candidates if not candidate[1] or not candidate[2]]
+    return unknown_size[0][0] if unknown_size else ''
 
 
 def _search_graphql_node_to_item(node):
@@ -601,6 +628,46 @@ def _search_graphql_node_to_item(node):
             }
         })
     return video_id, item
+
+
+def _carousel_graphql_variables(row_id, end_cursor):
+    return {
+        'rowId': row_id,
+        'carouselAfterCursor': end_cursor,
+        'carouselPageSize': 12,
+        'eddEnabled': False,
+        'imageParamsForStandardBoxart': {
+            'artworkType': 'SDP',
+            'dimension': {'width': 342, 'height': 192},
+            'features': {'fallbackStrategy': 'STILL'}
+        },
+        'imageParamsForRankedBoxart': {
+            'artworkType': 'BOXSHOT',
+            'dimension': {'width': 426, 'height': 607},
+            'features': {'fallbackStrategy': 'STILL', 'suppressTop10Badge': True}
+        },
+        'imageParamsForContinueWatchingBoxart': {
+            'artworkType': 'SDP',
+            'dimension': {'width': 342, 'height': 192},
+            'features': {'fallbackStrategy': 'STILL'}
+        },
+        'imageParamsForMobileGameBoxart': {
+            'artworkType': 'APP_ICON',
+            'dimension': {'width': 200, 'height': 200},
+            'formats': ['WEBP', 'JPG', 'PNG']
+        },
+        'imageParamsForCloudGameBoxart': {
+            'artworkType': 'SDP',
+            'dimension': {'width': 342, 'height': 192},
+            'features': {'fallbackStrategy': 'STILL'}
+        },
+        'imageParamsForCharacterCircle': {
+            'artworkType': 'SQUAREHEADSHOT_1000x1000',
+            'dimension': {'width': 200, 'height': 200},
+            'formats': ['WEBP', 'JPG', 'PNG']
+        },
+        'carouselVersion': '1'
+    }
 
 
 
@@ -814,6 +881,8 @@ def _normalize_browser_video_fields(path_response):
         if not isinstance(video, dict):
             continue
         item_summary = item_summaries.get(str(video_id), {})
+        if not item_summary:
+            item_summary = video.get('itemSummary', {}).get('value', {})
         if item_summary:
             video.setdefault('itemSummary', _value(item_summary))
             _set_browser_boxart(video, item_summary)
@@ -1376,16 +1445,17 @@ class DirectoryPathRequests:
         raise InvalidVideoListTypeError('No current direct My List content available')
 
     def _browser_mylist_video_list(self):
-        root_id, auth_url = self._get_current_loco_root_id()
-        list_id, row_key = self._browser_mylist_list_info(root_id, auth_url)
-        if row_key is not None:
-            try:
-                video_list = self._browser_mylist_loco_video_list(root_id, row_key, list_id, auth_url)
-            except InvalidVideoListTypeError:
-                LOG.warn('Falling back to direct My List request after LoCo row content lookup failed')
-                video_list = self._browser_mylist_direct_video_list(list_id, auth_url)
-        else:
-            video_list = self._browser_mylist_direct_video_list(list_id, auth_url)
+        self._browse_html_and_auth_url()
+        path_response = self._post_browser_path_evaluator([
+            ['mylist', ['id', 'listId', 'name', 'requestId', 'trackIds']],
+            ['mylist', BROWSER_MYLIST_RANGE, BROWSER_MYLIST_FIELDS]
+        ], 'https://www.netflix.com/browse/my-list')
+        mylist_data = path_response.get('mylist')
+        if not isinstance(mylist_data, dict):
+            raise InvalidVideoListTypeError('No browser My List data available')
+        path_response['lists'] = {'mylist': mylist_data}
+        _normalize_browser_video_fields(path_response)
+        video_list = VideoList(path_response, 'mylist')
         for video in video_list.videos.values():
             video.setdefault('queue', _value({}))
             video['queue'].setdefault('value', {})['inQueue'] = True
@@ -1423,7 +1493,6 @@ class DirectoryPathRequests:
             'https://www.netflix.com/latest')
         if str(list_id) not in path_response.get('lists', {}):
             raise InvalidVideoListTypeError(f'No LoLoMo category list with id {list_id}')
-        self._enrich_browser_video_list_metadata(path_response, str(list_id))
         return VideoList(path_response, str(list_id))
 
     def _browser_genre_video_list_by_id(self, genre_id, list_id):
@@ -1468,6 +1537,126 @@ class DirectoryPathRequests:
         ], 'https://www.netflix.com/browse')
 
     def _browser_continue_watching_list(self):
+        try:
+            return self._browser_continue_watching_graphql_list()
+        except (InvalidVideoListTypeError, WebsiteParsingError, KeyError, TypeError,
+                ValueError, req_exceptions.RequestException) as exc:
+            LOG.warn('GraphQL Continue Watching lookup failed ({}); using genre fallback',
+                     type(exc).__name__)
+            return self._browser_continue_watching_genre_fallback()
+
+    def _browser_continue_watching_graphql_list(self):
+        browse_html = self.nfsession.get_safe('browse')
+        api_data = self.nfsession.website_extract_session_data(browse_html)
+        self.nfsession.auth_url = api_data['auth_url']
+        react_context = website.extract_json(browse_html, 'reactContext')
+        graphql_data = _title_page_graphql_data(browse_html, react_context)
+        try:
+            section, connection = self._continue_watching_graphql_section(graphql_data)
+        except InvalidVideoListTypeError:
+            browse_html = self._active_profile_browse_html(browse_html)
+            api_data = self.nfsession.website_extract_session_data(browse_html)
+            self.nfsession.auth_url = api_data['auth_url']
+            react_context = website.extract_json(browse_html, 'reactContext')
+            graphql_data = _title_page_graphql_data(browse_html, react_context)
+            section, connection = self._continue_watching_graphql_section(graphql_data)
+        videos = OrderedDict()
+        self._append_continue_watching_graphql_edges(
+            videos, graphql_data, _iter_graphql_edges(connection))
+        page_info = connection.get('pageInfo') or {}
+        while page_info.get('hasNextPage') and page_info.get('endCursor'):
+            data = self._post_graphql(
+                'CarouselPage',
+                _carousel_graphql_variables(section.get('_id') or section['id'], page_info['endCursor']),
+                GRAPHQL_OP_CAROUSEL_PAGE)
+            next_section = data.get('node') or {}
+            next_connection = next_section.get('entities') or {}
+            previous_count = len(videos)
+            self._append_continue_watching_graphql_edges(
+                videos, {}, _iter_graphql_edges(next_connection))
+            page_info = next_connection.get('pageInfo') or {}
+            if len(videos) == previous_count:
+                break
+        if not videos:
+            raise InvalidVideoListTypeError('No GraphQL Continue Watching videos available')
+        return CustomVideoList({'videos': videos})
+
+    def _active_profile_browse_html(self, profile_gate_html):
+        parser = _ActiveProfileLinkParser(G.LOCAL_DB.get_active_profile_guid())
+        parser.feed(profile_gate_html.decode('utf-8', 'replace')
+                    if isinstance(profile_gate_html, bytes) else str(profile_gate_html))
+        if not parser.href:
+            raise InvalidVideoListTypeError('No active profile switch link available')
+        response = self.nfsession.session.get(
+            urljoin('https://www.netflix.com/browse', parser.href),
+            headers={
+                'Accept': 'text/html,application/xhtml+xml,application/xml',
+                'Referer': 'https://www.netflix.com/browse',
+                'User-Agent': common.get_user_agent(enable_android_mediaflag_fix=True)
+            },
+            timeout=8)
+        response.raise_for_status()
+        return response.content
+
+    @staticmethod
+    def _continue_watching_graphql_section(graphql_data):
+        for section in graphql_data.values():
+            if not isinstance(section, dict) or section.get('__typename') != 'PinotCarouselSection':
+                continue
+            connection = _graphql_ref_node(graphql_data, section.get('entities'))
+            if not isinstance(connection, dict):
+                continue
+            for edge in _iter_graphql_edges(connection):
+                edge_data = _graphql_ref_node(graphql_data, edge)
+                node = _graphql_ref_node(graphql_data, (edge_data or {}).get('node'))
+                if isinstance(node, dict) and node.get('__typename') == 'PinotContinueWatchingEntityTreatment':
+                    return section, connection
+        raise InvalidVideoListTypeError('No GraphQL Continue Watching section available')
+
+    @staticmethod
+    def _continue_watching_graphql_node(graphql_data, edge):
+        edge_data = _graphql_ref_node(graphql_data, edge) if graphql_data else edge
+        node = ((edge_data or {}).get('node') or {})
+        node = _graphql_ref_node(graphql_data, node) if graphql_data else node
+        if not isinstance(node, dict):
+            return None
+        entity = node.get('unifiedEntity') or {}
+        entity = _graphql_ref_node(graphql_data, entity) if graphql_data else entity
+        artwork_context = node.get('contextualArtwork') or {}
+        artwork_context = (_graphql_ref_node(graphql_data, artwork_context)
+                           if graphql_data else artwork_context)
+        artwork = {}
+        if isinstance(artwork_context, dict):
+            artwork_value = next(
+                (value for key, value in artwork_context.items() if key == 'artwork' or key.startswith('artwork(')),
+                {})
+            artwork = (_graphql_ref_node(graphql_data, artwork_value)
+                       if graphql_data else artwork_value)
+        return {
+            'displayString': node.get('displayString'),
+            'unifiedEntity': entity or {},
+            'contextualArtwork': {'artwork': artwork or {}}
+        }
+
+    def _append_continue_watching_graphql_edges(self, videos, graphql_data, edges):
+        for edge in edges:
+            node = self._continue_watching_graphql_node(graphql_data, edge)
+            item_data = _search_graphql_node_to_item(node or {})
+            if not item_data:
+                continue
+            video_id, item = item_data
+            entity = node.get('unifiedEntity') or {}
+            progress_entity = entity.get('currentEpisode') or entity
+            if graphql_data:
+                progress_entity = _graphql_ref_node(graphql_data, progress_entity) or progress_entity
+            bookmark = progress_entity.get('bookmark') or {}
+            if graphql_data:
+                bookmark = _graphql_ref_node(graphql_data, bookmark) or bookmark
+            item['bookmarkPosition'] = _value(bookmark.get('position', 0))
+            item['runtime'] = _value(progress_entity.get('runtimeSec') or entity.get('runtimeSec') or 0)
+            videos[video_id] = item
+
+    def _browser_continue_watching_loco_list(self):
         try:
             root_id, auth_url = self._get_current_loco_root_id()
         except InvalidVideoListTypeError:
@@ -1607,6 +1796,11 @@ class DirectoryPathRequests:
         # Some of this type of request have results fixed at ~40 from netflix
         # The 'length' tag never return to the actual total count of the elements
         LOG.debug('Requesting video list {}', list_id)
+        browser_genre_id = str((menu_data or {}).get('browser_genre_id') or '')
+        if browser_genre_id:
+            if str(list_id) == browser_genre_id:
+                return self._first_full_browser_genre_video_list(browser_genre_id)
+            return self._browser_genre_video_list_by_id(browser_genre_id, list_id)
         paths = (build_paths(['lists', list_id, RANGE_PLACEHOLDER, 'reference'], VIDEO_LIST_PARTIAL_PATHS) +
                  [['lists', list_id, 'componentSummary']])
         call_args = {
@@ -1802,22 +1996,7 @@ class DirectoryPathRequests:
     def req_video_list_search(self, search_term, perpetual_range_start=None):
         """Retrieve a video list by search term"""
         LOG.debug('Requesting video list by search term "{}"', search_term)
-        base_path = ['search', 'byTerm', f'|{search_term}', 'titles', PATH_REQUEST_SIZE_STD]
-        paths = ([base_path + [['id', 'name', 'requestId', 'trackIds']]] +
-                 build_paths(base_path + [RANGE_PLACEHOLDER, 'reference'], VIDEO_LIST_PARTIAL_PATHS))
-        call_args = {
-            'paths': paths,
-            'length_params': ['searchlist', ['search', 'byReference']],
-            'perpetual_range_start': perpetual_range_start
-        }
-        try:
-            path_response = self.nfsession.perpetual_path_request(**call_args)
-        except req_exceptions.HTTPError as exc:
-            if getattr(exc.response, 'status_code', None) != 404:
-                raise
-            LOG.warn('Falling back to browser GraphQL search for term "{}" after pathEvaluator 404', search_term)
-            return self._req_video_list_search_graphql(search_term)
-        return SearchVideoList(path_response)
+        return self._req_video_list_search_graphql(search_term)
 
     def _req_video_list_search_graphql(self, search_term):
         data = self._post_graphql(
@@ -1838,16 +2017,46 @@ class DirectoryPathRequests:
                 if item:
                     video_id, video_data = item
                     videos.setdefault(video_id, video_data)
-        metadata_by_video = OrderedDict()
-        for video_id, video_data in list(videos.items()):
-            metadata_by_video[video_id] = self._search_metadata_for_video(video_id)
-        self._enrich_search_title_page_metadata(metadata_by_video)
-        for video_id, metadata_video in metadata_by_video.items():
-            if metadata_video:
-                videos[video_id] = _merge_search_metadata_video(videos[video_id], metadata_video)
-                normalize_metadata_references(path_response, video_id, metadata_video, videos[video_id])
+        self._enrich_search_video_list(path_response)
         LOG.debug('GraphQL search returned {} video results for "{}"', len(videos), search_term)
         return CustomVideoList(path_response)
+
+    def _enrich_search_video_list(self, path_response):
+        videos = path_response.get('videos') or {}
+        video_ids = list(videos)[:SEARCH_TITLE_PAGE_METADATA_LIMIT]
+        if not video_ids:
+            return
+        metadata_by_video = {video_id: {} for video_id in video_ids}
+        title_metadata_by_video = {}
+        max_workers = min(SEARCH_TITLE_PAGE_METADATA_WORKERS, len(video_ids))
+        with (ThreadPoolExecutor(max_workers=max_workers) as metadata_executor,
+              ThreadPoolExecutor(max_workers=max_workers) as title_executor):
+            metadata_futures = {
+                metadata_executor.submit(self._search_metadata_for_video, video_id): video_id
+                for video_id in video_ids
+            }
+            title_futures = {
+                title_executor.submit(_search_title_page_metadata, video_id): video_id
+                for video_id in video_ids
+            }
+            for future in as_completed(metadata_futures):
+                video_id = metadata_futures[future]
+                try:
+                    metadata_by_video[video_id] = future.result()
+                except Exception as exc:  # pylint: disable=broad-except
+                    LOG.debug('Search metadata worker failed ({})', type(exc).__name__)
+            for future in as_completed(title_futures):
+                video_id = title_futures[future]
+                try:
+                    title_metadata_by_video[video_id] = future.result()
+                except Exception as exc:  # pylint: disable=broad-except
+                    LOG.debug('Search title metadata worker failed ({})', type(exc).__name__)
+        for video_id in video_ids:
+            metadata = _merge_title_page_metadata(
+                metadata_by_video[video_id], title_metadata_by_video.get(video_id))
+            video = _merge_search_metadata_video(videos[video_id], metadata)
+            videos[video_id] = video
+            normalize_metadata_references(path_response, video_id, metadata, video)
 
     def _enrich_search_title_page_metadata(self, metadata_by_video):
         video_ids = [
