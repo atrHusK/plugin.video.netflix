@@ -35,6 +35,7 @@ from resources.lib.utils.api_paths import (VIDEO_LIST_PARTIAL_PATHS, RANGE_PLACE
                                            SUPPLEMENTAL_TYPE_TRAILERS, build_paths, PATH_REQUEST_SIZE_MAX)
 from resources.lib.common import cache_utils
 from resources.lib.globals import G
+from resources.lib.services.nfsession.session.endpoints import ENDPOINTS
 from resources.lib.utils.logging import LOG
 
 GRAPHQL_URL = 'https://web.prod.cloud.netflix.com/graphql'
@@ -614,7 +615,7 @@ def _search_graphql_node_to_item(node):
         'watched': _value(False),
         'runtime': _value(entity.get('runtimeSec', 0)),
         'releaseYear': _value(entity.get('releaseYear', 0)),
-        'maturity': _value(entity.get('contentAdvisory', {})),
+        'maturity': _value(entity.get('contentAdvisory') or {}),
         'trackIds': _value({}),
         'requestId': _value('')
     }
@@ -2112,12 +2113,18 @@ class DirectoryPathRequests:
         metadata_by_video = {video_id: {} for video_id in video_ids}
         title_metadata_by_video = {}
         max_workers = min(SEARCH_TITLE_PAGE_METADATA_WORKERS, len(video_ids))
+        try:
+            metadata_request = self._prepare_search_metadata_request()
+        except Exception as exc:  # pylint: disable=broad-except
+            LOG.debug('Search metadata request setup failed ({})', type(exc).__name__)
+            metadata_request = None
         with ThreadPoolExecutor(max_workers=max_workers) as metadata_executor:
             with ThreadPoolExecutor(max_workers=max_workers) as title_executor:
-                metadata_futures = {
-                    metadata_executor.submit(self._search_metadata_for_video, video_id): video_id
+                metadata_futures = ({
+                    metadata_executor.submit(
+                        self._search_metadata_for_video, video_id, metadata_request): video_id
                     for video_id in video_ids
-                }
+                } if metadata_request else {})
                 title_futures = {
                     title_executor.submit(_search_title_page_metadata, video_id): video_id
                     for video_id in video_ids
@@ -2165,13 +2172,36 @@ class DirectoryPathRequests:
                 metadata_by_video[video_id] = _merge_title_page_metadata(
                     metadata_by_video.get(video_id), title_page_metadata)
 
-    def _search_metadata_for_video(self, video_id):
+    def _prepare_search_metadata_request(self):
+        # Resolve DB-backed auth/profile state before worker threads start. The add-on's
+        # shared SQLite connection and requests session are not safe for concurrent use.
+        endpoint_conf = ENDPOINTS['metadata']
+        _, headers, params = self.nfsession._prepare_request_properties(  # pylint: disable=protected-access
+            endpoint_conf, {'params': {}})
+        request_headers = dict(self.nfsession.session.headers)
+        request_headers.update(headers)
+        api_url = G.LOCAL_DB.get_value('api_endpoint_url', table=TABLE_SESSION)
+        return SimpleNamespace(
+            url=f"{api_url.rstrip('/')}{endpoint_conf['address']}",
+            headers=request_headers,
+            params=params,
+            cookies=self.nfsession.session.cookies.copy())
+
+    @staticmethod
+    def _search_metadata_for_video(video_id, metadata_request):
         try:
-            metadata_data = self.nfsession.get_safe(
-                endpoint='metadata',
-                params={'movieid': video_id, '_': int(time.time() * 1000)})
+            params = dict(metadata_request.params)
+            params.update({'movieid': video_id, '_': int(time.time() * 1000)})
+            response = requests.get(
+                metadata_request.url,
+                headers=metadata_request.headers,
+                params=params,
+                cookies=metadata_request.cookies,
+                timeout=(2, 4))
+            response.raise_for_status()
+            metadata_data = response.json() if response.content else {}
             return metadata_data.get('video') or {}
-        except (MetadataNotAvailable, KeyError, TypeError, req_exceptions.RequestException):
+        except (MetadataNotAvailable, KeyError, TypeError, ValueError, req_exceptions.RequestException):
             LOG.debug('Search metadata enrichment skipped for video {}', video_id)
             return {}
 
