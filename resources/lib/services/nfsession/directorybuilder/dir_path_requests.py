@@ -64,6 +64,9 @@ BROWSER_LOCO_CONTINUE_FIELDS = ['bookmarkPosition', 'runtime', 'summary', 'title
 BROWSER_LOCO_REFERENCE_FIELDS = ['availability', 'episodeCount', 'inRemindMeList', 'queue', 'summary']
 BROWSER_GENRE_SUBGENRE_FIELDS = ['id', 'name', 'unifiedEntityId']
 BROWSER_LOCO_DIRECT_RANGE = {'from': 0, 'to': PATH_REQUEST_SIZE_MAX}
+BROWSER_LOCO_HOME_ROW_RANGE = {'from': 4, 'to': 50}
+BROWSER_LOCO_HOME_VISIBLE_RANGE = {'from': 0, 'to': 8}
+BROWSER_LOCO_CONTINUE_LAZY_RANGE = {'from': 8, 'to': 100}
 SEARCH_GRAPHQL_PAGE_SIZE = 48
 
 
@@ -321,6 +324,11 @@ def _normalize_browser_video_fields(path_response):
         if item_summary:
             video.setdefault('itemSummary', _value(item_summary))
             _set_browser_boxart(video, item_summary)
+        current = video.get('current', {})
+        if isinstance(current, dict):
+            for key in BROWSER_LOCO_CONTINUE_FIELDS:
+                if key in current and key not in video:
+                    video[key] = current[key]
         summary = video.get('summary', {}).get('value', {})
         if not isinstance(summary, dict):
             summary = {}
@@ -724,6 +732,46 @@ class DirectoryPathRequests:
         if str(list_id) not in path_response.get('lists', {}):
             raise InvalidVideoListTypeError(f'No genre list with id {list_id}')
         return VideoList(path_response, str(list_id))
+
+    def _browser_continue_watching_loco_response(self, root_id, auth_url, row_range):
+        return self._post_current_loco_paths([
+            ['locos', root_id, row_range, 'componentSummary'],
+            ['locos', root_id, row_range, 'page', 0, LOCO_PAGE_RANGE, 'itemSummary'],
+            ['locos', root_id, row_range, 'page', 0, LOCO_PAGE_RANGE, 'reference',
+             BROWSER_LOCO_REFERENCE_FIELDS]
+        ], auth_url)
+
+    def _continue_watching_list_id(self, root_response):
+        for candidate_id, list_data in root_response.get('lists', {}).items():
+            summary = list_data.get('componentSummary', {}).get('value', {})
+            if summary.get('context') == 'continueWatching':
+                return candidate_id
+        return None
+
+    def _browser_continue_watching_list(self):
+        root_id, auth_url = self._get_current_loco_root_id()
+        root_response = self._browser_continue_watching_loco_response(
+            root_id, auth_url, BROWSER_LOCO_HOME_ROW_RANGE)
+        list_id = self._continue_watching_list_id(root_response)
+        if not list_id:
+            root_response = self._browser_continue_watching_loco_response(
+                root_id, auth_url, BROWSER_LOCO_HOME_VISIBLE_RANGE)
+            list_id = self._continue_watching_list_id(root_response)
+        if not list_id:
+            raise InvalidVideoListTypeError('No current home Continue Watching list available')
+        length = root_response['lists'][list_id].get('componentSummary', {}).get('value', {}).get('length', 0)
+        if length > BROWSER_LOCO_CONTINUE_LAZY_RANGE['from']:
+            lazy_response = self._post_browser_path_evaluator([
+                ['lists', list_id, BROWSER_LOCO_CONTINUE_LAZY_RANGE, 'itemSummary'],
+                ['lists', list_id, BROWSER_LOCO_CONTINUE_LAZY_RANGE, 'reference', BROWSER_LOCO_REFERENCE_FIELDS],
+                ['lists', list_id, BROWSER_LOCO_CONTINUE_LAZY_RANGE, 'reference', 'current',
+                 BROWSER_LOCO_CONTINUE_FIELDS]
+            ], 'https://www.netflix.com/browse')
+            root_response.setdefault('lists', {}).setdefault(list_id, {}).update(
+                lazy_response.get('lists', {}).get(list_id, {}))
+            root_response.setdefault('videos', {}).update(lazy_response.get('videos', {}))
+            _normalize_browser_video_fields(root_response)
+        return VideoList(root_response, str(list_id))
 
     def _first_loco_video_list(self, loco):
         for _list_id, video_list in loco.lists.items():

@@ -83,7 +83,7 @@ class DirectoryBuilder(DirectoryPathRequests):
             'mostViewed': ('mostWatched',)
         }
         if not is_dynamic_id and menu_id == 'continueWatching':
-            video_list = self._video_list_from_genre_context('1592210', ('continueWatching',))
+            video_list = self._browser_continue_watching_list()
         elif not is_dynamic_id and menu_id in current_contexts:
             video_list = self._video_list_from_lolomo_category_context(
                 'comingSoon', current_contexts[menu_id], fallback_first=True)
@@ -139,7 +139,11 @@ class DirectoryBuilder(DirectoryPathRequests):
             loco_list = self.req_loco_list_genre(genre_id)
             for list_id, video_list in loco_list.lists.items():
                 if video_list.get('context') in contexts:
-                    return self._browser_genre_video_list_by_id(genre_id, list_id)
+                    try:
+                        return self._browser_genre_video_list_by_id(genre_id, list_id)
+                    except Exception as exc:  # pylint: disable=broad-except
+                        LOG.warn('Using materialized genre row {} after list lookup failed: {}', list_id, exc)
+                        return video_list
         except Exception as exc:
             LOG.warn('Continue Watching genre fallback failed: {}', exc)
         return CustomVideoList({'videos': {}})
