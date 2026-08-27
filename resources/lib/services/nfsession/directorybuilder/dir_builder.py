@@ -79,7 +79,7 @@ class DirectoryBuilder(DirectoryPathRequests):
         if not is_dynamic_id:
             list_id = self.get_loco_list_id_by_context(menu_data['loco_contexts'][0])
         # pylint: disable=unexpected-keyword-arg
-        video_list = self.req_video_list(list_id, no_use_cache=menu_data.get('no_use_cache'))
+        video_list = self.req_video_list(list_id, menu_data=menu_data, no_use_cache=menu_data.get('no_use_cache'))
         return build_video_listing(video_list, menu_data,
                                    mylist_items=self.req_mylist_items())
 
