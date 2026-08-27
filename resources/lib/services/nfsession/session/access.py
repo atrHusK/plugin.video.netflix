@@ -140,7 +140,14 @@ class SessionAccess(SessionCookie, SessionHTTPRequests):
             if exc.response.status_code == 500:
                 # This endpoint raise HTTP error 500 when the password is wrong
                 raise LoginError(common.get_local_string(12344)) from exc
-            raise
+            if exc.response.status_code not in (404, 410):
+                raise
+            # The legacy profilehub endpoint has been removed for some accounts.
+            # The Auth Key cookies were already validated above, so allow login to
+            # continue while retaining the supplied password for MSL compatibility.
+            LOG.warn('Password verification endpoint is unavailable (HTTP {}); '
+                     'continuing Auth Key login without password verification',
+                     exc.response.status_code)
         common.set_credentials({'email': email, 'password': password})
         LOG.info('Login successful')
         ui.show_notification(common.get_local_string(30109))

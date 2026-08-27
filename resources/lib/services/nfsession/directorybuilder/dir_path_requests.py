@@ -401,8 +401,11 @@ def _episode_node_to_item(node, season_number, metadata=None):
     image_url = ''
     if isinstance(artwork, dict):
         image_url = artwork.get('url') or (artwork.get('image') or {}).get('url') or ''
+    summary = _summary(episode_id, node.get('title') or '', 'episode', node.get('number'))
+    if season_number is not None:
+        summary['value']['season'] = season_number
     return episode_id, {
-        'summary': _summary(episode_id, node.get('title') or '', 'episode', node.get('number')),
+        'summary': summary,
         'title': _value(node.get('title') or ''),
         'synopsis': _value(synopsis),
         'regularSynopsis': _value(synopsis),
@@ -2114,7 +2117,7 @@ class DirectoryPathRequests:
         title_metadata_by_video = {}
         max_workers = min(SEARCH_TITLE_PAGE_METADATA_WORKERS, len(video_ids))
         try:
-            metadata_request = self._prepare_search_metadata_request()
+            metadata_request = self._prepare_metadata_request()
         except Exception as exc:  # pylint: disable=broad-except
             LOG.debug('Search metadata request setup failed ({})', type(exc).__name__)
             metadata_request = None
@@ -2122,7 +2125,7 @@ class DirectoryPathRequests:
             with ThreadPoolExecutor(max_workers=max_workers) as title_executor:
                 metadata_futures = ({
                     metadata_executor.submit(
-                        self._search_metadata_for_video, video_id, metadata_request): video_id
+                        self._metadata_for_video_from_request, video_id, metadata_request): video_id
                     for video_id in video_ids
                 } if metadata_request else {})
                 title_futures = {
@@ -2172,7 +2175,7 @@ class DirectoryPathRequests:
                 metadata_by_video[video_id] = _merge_title_page_metadata(
                     metadata_by_video.get(video_id), title_page_metadata)
 
-    def _prepare_search_metadata_request(self):
+    def _prepare_metadata_request(self):
         # Resolve DB-backed auth/profile state before worker threads start. The add-on's
         # shared SQLite connection and requests session are not safe for concurrent use.
         endpoint_conf = ENDPOINTS['metadata']
@@ -2180,15 +2183,20 @@ class DirectoryPathRequests:
             endpoint_conf, {'params': {}})
         request_headers = dict(self.nfsession.session.headers)
         request_headers.update(headers)
+        # Stored Netflix cookies use PickleableCookieJar (a plain CookieJar),
+        # which has no .copy() method. Clone it into RequestsCookieJar so a
+        # missing method cannot disable all list/search metadata enrichment.
+        request_cookies = requests.cookies.merge_cookies(
+            requests.cookies.RequestsCookieJar(), self.nfsession.session.cookies)
         api_url = G.LOCAL_DB.get_value('api_endpoint_url', table=TABLE_SESSION)
         return SimpleNamespace(
             url=f"{api_url.rstrip('/')}{endpoint_conf['address']}",
             headers=request_headers,
             params=params,
-            cookies=self.nfsession.session.cookies.copy())
+            cookies=request_cookies)
 
     @staticmethod
-    def _search_metadata_for_video(video_id, metadata_request):
+    def _metadata_for_video_from_request(video_id, metadata_request):
         try:
             params = dict(metadata_request.params)
             params.update({'movieid': video_id, '_': int(time.time() * 1000)})

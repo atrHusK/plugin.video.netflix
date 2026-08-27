@@ -173,10 +173,17 @@ class DirectoryBuilder(DirectoryPathRequests):
         if not pending:
             return video_list
 
+        try:
+            metadata_request = self._prepare_metadata_request()
+        except Exception as exc:  # pylint: disable=broad-except
+            LOG.debug('List metadata request setup failed ({})', type(exc).__name__)
+            metadata_request = None
+
         def _load_metadata(item):
             videoid, _video, _needs_art, needs_refs, needs_year, needs_synopsis = item
             try:
-                metadata = self._search_metadata_for_video(videoid.value)
+                metadata = (self._metadata_for_video_from_request(videoid.value, metadata_request)
+                            if metadata_request else {})
             except Exception as exc:  # pylint: disable=broad-except
                 LOG.debug('Metadata enrichment skipped for {}: {}', videoid, exc)
                 metadata = {}

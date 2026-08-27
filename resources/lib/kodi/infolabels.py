@@ -58,6 +58,8 @@ def get_info(videoid, item, raw_data, profile_language_code='', delayed_db_op=Fa
         updated = False
         updated = _refresh_missing_plot(infos, item) or updated
         updated = _refresh_missing_atomic_infos(infos, item, ('Trailer', 'Year')) or updated
+        if videoid.mediatype == common.VideoId.EPISODE:
+            updated = _refresh_episode_numbers(infos, item) or updated
         updated = _refresh_missing_referenced_infos(infos, item, raw_data) or updated
         updated = _refresh_missing_profile_cast(infos, videoid, profile_language_code) or updated
         if updated:
@@ -111,6 +113,25 @@ def _refresh_missing_atomic_infos(infos, item, targets):
     for key in targets:
         value = atomic_infos.get(key)
         if value and not infos.get(key):
+            infos[key] = value
+            updated = True
+    return updated
+
+
+def _refresh_episode_numbers(infos, item):
+    """Refresh episode number infolabels from a newer episode item."""
+    if not item:
+        return False
+    summary = item.get('summary', {}).get('value', {})
+    if not isinstance(summary, dict):
+        return False
+    updated = False
+    for key, source in (('Season', 'season'), ('Episode', 'episode')):
+        value = summary.get(source)
+        if value is None:
+            continue
+        value = _transform_value(key, value)
+        if infos.get(key) != value:
             infos[key] = value
             updated = True
     return updated
@@ -400,7 +421,14 @@ def _assign_art(videoid, **kwargs):
     """Assign the art available from Netflix to appropriate Kodi art"""
     poster = _best_art([kwargs['poster'], kwargs['fallback']])
     wide_art = _best_art([kwargs['interesting_moment'], kwargs['boxart_large'], kwargs['boxart_small']])
-    thumb = (wide_art if videoid.mediatype in (common.VideoId.EPISODE, common.VideoId.SUPPLEMENTAL) else poster)
+    if videoid.mediatype in (common.VideoId.EPISODE, common.VideoId.SUPPLEMENTAL):
+        thumb = wide_art
+    elif videoid.mediatype == common.VideoId.UNSPECIFIED:
+        # Video-list/category folders may only have a landscape preview from the
+        # browser-shaped response. Kodi skins commonly render these folders via thumb.
+        thumb = poster or wide_art
+    else:
+        thumb = poster
     art = {'poster': poster,
            'fanart': _best_art([kwargs['fanart'], wide_art]),
            'thumb': thumb}
