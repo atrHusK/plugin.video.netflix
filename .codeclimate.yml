@@ -30,7 +30,7 @@ exclude_paths:
   - "resources/settings.xml"
   - "tests/"
   - "addon.xml"
-  - "changelog.txt"
+  - "changelog.md"
   - "Contributing.md"
   - "Code_of_Conduct.md"
   - "LICENSE.md"

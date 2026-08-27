@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<addon id="plugin.video.netflix" name="Netflix" version="2.0.6" provider-name="community">
+<addon id="plugin.video.netflix" name="Netflix" version="2.0.7+atrHusK" provider-name="community">
     <requires>
         <import addon="xbmc.python" version="3.0.0"/>
         <import addon="script.module.addon.signals" version="0.0.6+matrix.1"/>
@@ -85,5 +85,35 @@
         <website>https://www.netflix.com</website>
         <forum>https://forum.kodi.tv/showthread.php?tid=329767</forum>
         <source>https://github.com/CastagnaIT/plugin.video.netflix</source>
+        <news>v2.0.7+atrHusK (2026-09-28)
+v2.0.7
+- Experimental fix for non-chrome based widevine installations (inputstreamhelper >= 0.8.6) @rysson (and before that @mostman)
+- Dutch language file updates @atrHusK
+- Forwarded Build and release related changes @atrHusK
+- Forwarded a various minor corrections (plumbing) @atrHusK
+- Rebased on @Lekma master which contains the following updated and additional fixes (v1.24.1+atrHusK incorporated on go-vegan's patch8)
+    - @go-vegan patch9 to 19:
+        - year information
+        - ignored resume position fix
+        - Various cast related fixes
+        - Various search related fixes
+        - Various thumbnail related fixes
+        - Add to My list @twprh
+        - Empty 'My list', 'All TV Shows', 'All Movies'
+        - 'Continue watching' showing only 8 titles
+        - Various 'New on Netflix' fixes
+        - Various 'Top picks' fixes
+        - Netflix trailers not always found, fallback to promo
+        - Compatibility with python 3.8 @Publish3r
+        - UTF in 'Continue watching' @jankofron
+        - Episode numbering @jankofron
+        - Experimental fix: Disabled password verification (access.py)
+    - @Breezyslasher fixes 18-26
+        - Support OTP for login
+        - Various api related changes and fixes
+    - @jesubiag
+        - SQLite related fixes
+        - Various kodi related fixes
+        </news>
     </extension>
 </addon>

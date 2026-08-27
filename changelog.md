@@ -1,5 +1,50 @@
-v2.0.0 (2026-08-28)
-- https://github.com/CastagnaIT/plugin.video.netflix/issues/1792
+v2.0.7 (2026-09-28)
+- Experimental fix for non-chrome based widevine installations (inputstreamhelper >= 0.8.6) @rysson (and before that @mostman)
+- Dutch language file updates @atrHusK
+- Forwarded Build and release related changes @atrHusK
+- Forwarded a various minor corrections (plumbing) @atrHusK
+- Rebased on @Lekma master which contains the following updated and additional fixes (v1.24.1+atrHusK incorporated on go-vegan's patch8)
+    - @go-vegan patch9 to 19:
+        - year information
+        - ignored resume position fix
+        - Various cast related fixes
+        - Various search related fixes
+        - Various thumbnail related fixes
+        - Add to My list @twprh
+        - Empty 'My list', 'All TV Shows', 'All Movies'
+        - 'Continue watching' showing only 8 titles
+        - Various 'New on Netflix' fixes
+        - Various 'Top picks' fixes
+        - Netflix trailers not always found, fallback to promo
+        - Compatibility with python 3.8 @Publish3r
+        - UTF in 'Continue watching' @jankofron
+        - Episode numbering @jankofron
+        - Experimental fix: Disabled password verification (access.py)
+    - @Breezyslasher fixes 18-26
+        - Support OTP for login
+        - Various api related changes and fixes
+    - @jesubiag
+        - SQLite related fixes
+        - Various kodi related fixes
+
+v1.24.1 (2026-06-29)
+- Should fix playback issues than can sometimes occur, like not starting at all or sound-only playback (jankofron)  
+  See https://github.com/CastagnaIT/plugin.video.netflix/pull/1791
+- Should fix 'Website parsing error: unable to extract reactContext' (biocoder-frodo)  
+  See https://github.com/CastagnaIT/plugin.video.netflix/pull/1727
+- Fixes 'Profile switching' to profiles without pin (Krumbthi)  
+  See https://github.com/CastagnaIT/plugin.video.netflix/pull/1783
+- Fixes plugin no longer functional due to even more API changes by Netflix (go-vegan)  
+  Biggest part of the fixes, lots of thanks to go-vegan \o/  
+  Using patch 8, see https://github.com/CastagnaIT/plugin.video.netflix/issues/1792  
+  NB. That patch also contains the work from the others mentioned above.
+- Fixed profile switching to a pin locked profile (AtrHusK)
+- Fixed 'My List' (Ruud68)
+- Fixed Search (AtrHusK)
+- Developers: Fixed GitHub producing a release with the updated code; Added option to build a prerelease
+
+v1.24.0  (2026-06-24)
+- Experimental merge, abandoned.
 
 v1.23.5 (2025-08-24)
 - Fix esn error on login due to website changes

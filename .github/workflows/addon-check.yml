@@ -12,10 +12,10 @@ jobs:
     name: Kodi addon checker
     steps:
     - name: Checkout
-      uses: actions/checkout@v2
+      uses: actions/checkout@v4
     - name: Kodi addon checker validation
       id: kodi-addon-checker
-      uses: xbmc/action-kodi-addon-checker@master
+      uses: atrHusK/action-kodi-addon-checker@master
       with:
         kodi-version: matrix
         addon-id: ${{ github.event.repository.name }}
