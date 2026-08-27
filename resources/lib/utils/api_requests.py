@@ -37,14 +37,14 @@ MY_LIST_GRAPHQL_MUTATIONS = {
 # The website sends the reminders of the not yet available titles with these mutations
 REMIND_ME_GRAPHQL_MUTATIONS = {
     'add': {
-        'operation_name': 'AddToRemindMe',
-        'operation_id': '539a03c0-daa1-42b7-b5ff-1e31ec0bc833',
+        'operation_name': 'AddReminder',
+        'operation_id': 'a5e82016-e05b-4704-b294-276399a300ec',
         'response_key': 'addUnifiedEntityToRemindMe',
         'expected_state': True
     },
     'remove': {
-        'operation_name': 'RemoveFromRemindMe',
-        'operation_id': '1a7899b5-6087-4e6c-ad54-72afa06528bb',
+        'operation_name': 'RemoveReminder',
+        'operation_id': 'd43e296a-cada-4621-95ad-1cebb05dac53',
         'response_key': 'removeUnifiedEntityFromRemindMe',
         'expected_state': False
     }
@@ -243,7 +243,7 @@ def _update_remindme_graphql(operation, videoid, trackid):
     if not mutation:
         raise APIError(f'Unsupported remind me operation: {operation}')
     # The website asks for the title by its unified id, the plain number is not accepted
-    variables = {'unifiedEntityId': f'Video:{videoid.value}'}
+    variables = {'entityId': f'Video:{videoid.value}'}
     if trackid and str(trackid) != 'None':
         variables['trackId'] = str(trackid)
     response = common.make_call(
