@@ -28,8 +28,8 @@ from resources.lib.common.exceptions import (InvalidVideoListTypeError, InvalidV
                                              WebsiteParsingError)
 from resources.lib.database.db_utils import TABLE_SESSION
 from resources.lib.utils.api_paths import (VIDEO_LIST_PARTIAL_PATHS, RANGE_PLACEHOLDER, VIDEO_LIST_BASIC_PARTIAL_PATHS,
-                                           SEASONS_PARTIAL_PATHS, EPISODES_PARTIAL_PATHS, ART_PARTIAL_PATHS, ART_SIZE_FHD, ART_SIZE_POSTER, ART_SIZE_SD,
-                                           TRAILER_PARTIAL_PATHS, PATH_REQUEST_SIZE_STD, build_paths,
+                                           SEASONS_PARTIAL_PATHS, EPISODES_PARTIAL_PATHS, ART_PARTIAL_PATHS,
+                                           ART_SIZE_POSTER, TRAILER_PARTIAL_PATHS, PATH_REQUEST_SIZE_STD, build_paths,
                                            PATH_REQUEST_SIZE_MAX)
 from resources.lib.common import cache_utils
 from resources.lib.globals import G
@@ -425,17 +425,19 @@ def _normalize_browser_list_lengths(path_response):
                 del list_data[key]
 
 
+def _browser_reference_paths(reference_path):
+    return [reference_path + [BROWSER_LOCO_REFERENCE_FIELDS]]
+
+
 def _set_browser_boxart(video, item_summary):
     boxart = item_summary.get('boxArt') or {}
     image_url = boxart.get('url')
+    video.setdefault('itemSummary', _value(item_summary))
     if not image_url:
         return
     art_value = {'url': image_url}
-    video.setdefault('itemSummary', _value(item_summary))
     video.setdefault('boxarts', {})
-    for size in (ART_SIZE_SD, ART_SIZE_FHD, ART_SIZE_POSTER):
-        video['boxarts'].setdefault(size, {'jpg': {'value': art_value}})
-    video.setdefault('interestingMoment', {ART_SIZE_FHD: {'jpg': {'value': art_value}}})
+    video['boxarts'].setdefault(ART_SIZE_POSTER, {'jpg': {'value': art_value}})
 
 
 def _normalize_browser_video_fields(path_response):
@@ -832,32 +834,34 @@ class DirectoryPathRequests:
             root_path + [0, 0, 'reference', 'current', BROWSER_LOCO_CURRENT_FIELDS],
             root_path + [0, 'page', 0, LOCO_PAGE_RANGE, 'itemSummary'],
             root_path + [BROWSER_LOCO_OTHER_ROW_KEYS, 'page', 0, LOCO_PAGE_RANGE, 'itemSummary'],
-            root_path + [BROWSER_LOCO_ROW_KEYS, 'page', 0, LOCO_PAGE_RANGE, 'reference', BROWSER_LOCO_REFERENCE_FIELDS],
             root_path + ['continueWatching', 'page', 0, LOCO_PAGE_RANGE, 'reference', 'current',
                          BROWSER_LOCO_CONTINUE_FIELDS]
         ]
+        paths.extend(_browser_reference_paths(
+            root_path + [BROWSER_LOCO_ROW_KEYS, 'page', 0, LOCO_PAGE_RANGE, 'reference']))
         if include_full_rows:
-            paths.extend([
-                root_path + [BROWSER_LOCO_ROW_KEYS, BROWSER_LOCO_DIRECT_RANGE, 'itemSummary'],
-                root_path + [BROWSER_LOCO_ROW_KEYS, BROWSER_LOCO_DIRECT_RANGE, 'reference', BROWSER_LOCO_REFERENCE_FIELDS]
-            ])
+            paths.append(root_path + [BROWSER_LOCO_ROW_KEYS, BROWSER_LOCO_DIRECT_RANGE, 'itemSummary'])
+            paths.extend(_browser_reference_paths(
+                root_path + [BROWSER_LOCO_ROW_KEYS, BROWSER_LOCO_DIRECT_RANGE, 'reference']))
         if include_genre_paths:
             paths.insert(0, root_path[:-1] + [['name', 'trackIds']])
         return paths
 
     def _browser_video_list_paths(self, list_id):
-        return [
+        paths = [
             ['lists', list_id, ['componentSummary', 'debugRequest']],
-            ['lists', list_id, 'page', 0, LOCO_PAGE_RANGE, 'itemSummary'],
-            ['lists', list_id, 'page', 0, LOCO_PAGE_RANGE, 'reference', BROWSER_LOCO_REFERENCE_FIELDS]
+            ['lists', list_id, 'page', 0, LOCO_PAGE_RANGE, 'itemSummary']
         ]
+        paths.extend(_browser_reference_paths(['lists', list_id, 'page', 0, LOCO_PAGE_RANGE, 'reference']))
+        return paths
 
     def _browser_video_list_full_paths(self, list_id):
-        return [
+        paths = [
             ['lists', list_id, ['componentSummary', 'debugRequest']],
-            ['lists', list_id, BROWSER_LOCO_DIRECT_RANGE, 'itemSummary'],
-            ['lists', list_id, BROWSER_LOCO_DIRECT_RANGE, 'reference', BROWSER_LOCO_REFERENCE_FIELDS]
+            ['lists', list_id, BROWSER_LOCO_DIRECT_RANGE, 'itemSummary']
         ]
+        paths.extend(_browser_reference_paths(['lists', list_id, BROWSER_LOCO_DIRECT_RANGE, 'reference']))
+        return paths
 
     def _req_browser_lolomo_category(self, category_name):
         self._browse_html_and_auth_url()
@@ -918,12 +922,12 @@ class DirectoryPathRequests:
             return [
                 row_path + ['componentSummary'],
                 row_path + [item_range, 'itemSummary'],
-                row_path + [item_range, 'reference', BROWSER_LOCO_REFERENCE_FIELDS]
+                *_browser_reference_paths(row_path + [item_range, 'reference'])
             ]
         return [
             row_path + ['componentSummary'],
             row_path + ['page', 0, item_range, 'itemSummary'],
-            row_path + ['page', 0, item_range, 'reference', BROWSER_LOCO_REFERENCE_FIELDS]
+            *_browser_reference_paths(row_path + ['page', 0, item_range, 'reference'])
         ]
 
     def _browser_mylist_loco_video_list(self, root_id, row_key, list_id, auth_url):
@@ -990,16 +994,29 @@ class DirectoryPathRequests:
         return self._post_current_loco_paths([
             ['locos', root_id, row_range, 'componentSummary'],
             ['locos', root_id, row_range, 'page', 0, LOCO_PAGE_RANGE, 'itemSummary'],
-            ['locos', root_id, row_range, 'page', 0, LOCO_PAGE_RANGE, 'reference',
-             BROWSER_LOCO_REFERENCE_FIELDS]
+            *_browser_reference_paths(['locos', root_id, row_range, 'page', 0, LOCO_PAGE_RANGE, 'reference'])
         ], auth_url)
 
     def _continue_watching_list_id(self, root_response):
+        candidates = []
         for candidate_id, list_data in root_response.get('lists', {}).items():
             summary = list_data.get('componentSummary', {}).get('value', {})
-            if summary.get('context') == 'continueWatching':
-                return candidate_id
-        return None
+            if summary.get('context') != 'continueWatching':
+                continue
+            length = summary.get('length') or 0
+            materialized_items = sum(1 for key, value in list_data.items()
+                                     if str(key).isdigit() and isinstance(value, dict))
+            candidates.append((length, materialized_items, candidate_id))
+        return max(candidates)[2] if candidates else None
+
+    def _browser_continue_watching_direct_response(self, list_id):
+        return self._post_browser_path_evaluator([
+            ['lists', list_id, ['componentSummary', 'debugRequest']],
+            ['lists', list_id, BROWSER_LOCO_DIRECT_RANGE, 'itemSummary'],
+            *_browser_reference_paths(['lists', list_id, BROWSER_LOCO_DIRECT_RANGE, 'reference']),
+            ['lists', list_id, BROWSER_LOCO_DIRECT_RANGE, 'reference', 'current',
+             BROWSER_LOCO_CONTINUE_FIELDS]
+        ], 'https://www.netflix.com/browse')
 
     def _browser_continue_watching_list(self):
         try:
@@ -1015,18 +1032,35 @@ class DirectoryPathRequests:
             list_id = self._continue_watching_list_id(root_response)
         if not list_id:
             raise InvalidVideoListTypeError('No current home Continue Watching list available')
+        try:
+            direct_response = self._browser_continue_watching_direct_response(list_id)
+            root_response.setdefault('lists', {}).setdefault(list_id, {}).update(
+                direct_response.get('lists', {}).get(list_id, {}))
+            root_response.setdefault('videos', {}).update(direct_response.get('videos', {}))
+            _normalize_browser_video_fields(root_response)
+        except req_exceptions.HTTPError as exc:
+            if getattr(exc.response, 'status_code', None) not in (404, 412):
+                raise
+            LOG.warn('Continue Watching direct list range returned {}; using home row data',
+                     exc.response.status_code)
         length = root_response['lists'][list_id].get('componentSummary', {}).get('value', {}).get('length', 0)
         if length > BROWSER_LOCO_CONTINUE_LAZY_RANGE['from']:
-            lazy_response = self._post_browser_path_evaluator([
-                ['lists', list_id, BROWSER_LOCO_CONTINUE_LAZY_RANGE, 'itemSummary'],
-                ['lists', list_id, BROWSER_LOCO_CONTINUE_LAZY_RANGE, 'reference', BROWSER_LOCO_REFERENCE_FIELDS],
-                ['lists', list_id, BROWSER_LOCO_CONTINUE_LAZY_RANGE, 'reference', 'current',
-                 BROWSER_LOCO_CONTINUE_FIELDS]
-            ], 'https://www.netflix.com/browse')
-            root_response.setdefault('lists', {}).setdefault(list_id, {}).update(
-                lazy_response.get('lists', {}).get(list_id, {}))
-            root_response.setdefault('videos', {}).update(lazy_response.get('videos', {}))
-            _normalize_browser_video_fields(root_response)
+            try:
+                lazy_response = self._post_browser_path_evaluator([
+                    ['lists', list_id, BROWSER_LOCO_CONTINUE_LAZY_RANGE, 'itemSummary'],
+                    *_browser_reference_paths(['lists', list_id, BROWSER_LOCO_CONTINUE_LAZY_RANGE, 'reference']),
+                    ['lists', list_id, BROWSER_LOCO_CONTINUE_LAZY_RANGE, 'reference', 'current',
+                     BROWSER_LOCO_CONTINUE_FIELDS]
+                ], 'https://www.netflix.com/browse')
+                root_response.setdefault('lists', {}).setdefault(list_id, {}).update(
+                    lazy_response.get('lists', {}).get(list_id, {}))
+                root_response.setdefault('videos', {}).update(lazy_response.get('videos', {}))
+                _normalize_browser_video_fields(root_response)
+            except req_exceptions.HTTPError as exc:
+                if getattr(exc.response, 'status_code', None) not in (404, 412):
+                    raise
+                LOG.warn('Continue Watching lazy range returned {}; using available row data',
+                         exc.response.status_code)
         return VideoList(root_response, str(list_id))
 
     def _browser_continue_watching_genre_fallback(self):
@@ -1158,7 +1192,14 @@ class DirectoryPathRequests:
             try:
                 return self._browser_mylist_video_list()
             except InvalidVideoListTypeError:
-                LOG.warn('Falling back to legacy sorted My List request after current queue lookup failed')
+                LOG.warn('Returning empty My List after current queue lookup failed')
+                return CustomVideoList({'videos': {}})
+            except req_exceptions.HTTPError as exc:
+                if getattr(exc.response, 'status_code', None) not in (404, 412):
+                    raise
+                LOG.warn('Returning empty My List after browser-shaped request returned {}',
+                         exc.response.status_code)
+                return CustomVideoList({'videos': {}})
 
         base_path = [context_name]
         response_type = 'stdlist'

@@ -24,7 +24,7 @@ from resources.lib.kodi import ui
 from resources.lib.services.nfsession.session.path_requests import SessionPathRequests
 from resources.lib.utils import cookies
 from resources.lib.utils.api_paths import (EPISODES_PARTIAL_PATHS, ART_PARTIAL_PATHS, build_paths,
-                                           VIDEO_LIST_PARTIAL_PATHS)
+                                           VIDEO_LIST_PARTIAL_PATHS, ART_SIZE_FHD, ART_SIZE_POSTER)
 from resources.lib.utils.logging import LOG, measure_exec_time_decorator
 
 
@@ -280,7 +280,8 @@ class NFSessionOperations(SessionPathRequests):
     def _metadata_video_to_path_item(videoid, video):
         title = video.get('title') or str(videoid.value)
         synopsis = video.get('synopsis') or video.get('regularSynopsis') or ''
-        image_url = NFSessionOperations._find_metadata_image_url(video)
+        boxart_url = NFSessionOperations._find_metadata_image_url(video, ('boxArt', 'boxart', 'artwork'))
+        still_url = NFSessionOperations._find_metadata_image_url(video, ('interestingMoment', 'interestingMomentUrl'))
         item = {
             'summary': {'value': {
                 'id': int(videoid.value),
@@ -303,20 +304,17 @@ class NFSessionOperations(SessionPathRequests):
             'trackIds': {'value': {}},
             'requestId': {'value': ''}
         }
-        if image_url:
-            art_value = {'url': image_url}
-            item['boxarts'] = {
-                '_342x192': {'jpg': {'value': art_value}},
-                '_1280x720': {'jpg': {'value': art_value}},
-                '_665x375': {'jpg': {'value': art_value}}
-            }
-            item['interestingMoment'] = {'_1280x720': {'jpg': {'value': art_value}}}
-            item['itemSummary'] = {'value': {'id': int(videoid.value), 'title': title, 'boxArt': {'url': image_url}}}
+        if boxart_url:
+            art_value = {'url': boxart_url}
+            item['boxarts'] = {ART_SIZE_POSTER: {'jpg': {'value': art_value}}}
+            item['itemSummary'] = {'value': {'id': int(videoid.value), 'title': title, 'boxArt': {'url': boxart_url}}}
+        if still_url:
+            item['interestingMoment'] = {ART_SIZE_FHD: {'jpg': {'value': {'url': still_url}}}}
         return item
 
     @staticmethod
-    def _find_metadata_image_url(video):
-        for key in ('boxArt', 'boxart', 'artwork', 'interestingMoment', 'interestingMomentUrl'):
+    def _find_metadata_image_url(video, keys):
+        for key in keys:
             value = video.get(key)
             if isinstance(value, str) and value.startswith('http'):
                 return value

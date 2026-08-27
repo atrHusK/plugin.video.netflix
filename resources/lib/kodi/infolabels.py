@@ -150,9 +150,7 @@ def get_art(videoid, item, profile_language_code='', delayed_db_op=False):
     try:
         art = G.CACHE.get(CACHE_ARTINFO, cache_identifier)
         parsed_art = parse_art(videoid, item)
-        if any(parsed_art.get(key) and not art.get(key)
-               for key in ('poster', 'fanart', 'thumb', 'landscape')):
-            art.update({key: value for key, value in parsed_art.items() if value})
+        if _refresh_cached_art(art, parsed_art, item):
             G.CACHE.add(CACHE_ARTINFO, cache_identifier, art,
                         delayed_db_op=delayed_db_op)
     except CacheMiss:
@@ -160,6 +158,45 @@ def get_art(videoid, item, profile_language_code='', delayed_db_op=False):
         G.CACHE.add(CACHE_ARTINFO, cache_identifier, art,
                     delayed_db_op=delayed_db_op)
     return art
+
+
+def _refresh_cached_art(art, parsed_art, item):
+    updated = False
+    for key in ('poster', 'fanart', 'thumb', 'landscape', 'clearlogo'):
+        if parsed_art.get(key) and not art.get(key):
+            art[key] = parsed_art[key]
+            updated = True
+    if _repair_browser_boxart_wide_cache(art, parsed_art, item):
+        updated = True
+    return updated
+
+
+def _repair_browser_boxart_wide_cache(art, parsed_art, item):
+    fallback = common.get_path_safe(['itemSummary', 'value', 'boxArt', 'url'], item)
+    updated = False
+    if fallback:
+        for key in ('fanart', 'thumb', 'landscape'):
+            if art.get(key) == fallback and parsed_art.get(key) != fallback:
+                art[key] = parsed_art.get(key, '')
+                updated = True
+        if art.get('poster') == fallback and parsed_art.get('poster') != fallback:
+            art['poster'] = parsed_art.get('poster', '')
+            updated = True
+    parsed_poster = parsed_art.get('poster')
+    if parsed_poster and parsed_poster != fallback and art.get('poster') != parsed_poster:
+        if not art.get('poster') or art.get('poster') in (art.get('landscape'), art.get('fanart'), fallback):
+            art['poster'] = parsed_poster
+            updated = True
+    parsed_thumb = parsed_art.get('thumb')
+    if (parsed_thumb and parsed_thumb == parsed_poster and parsed_thumb != fallback
+            and art.get('thumb') != parsed_thumb):
+        art['thumb'] = parsed_thumb
+        updated = True
+    elif parsed_thumb and art.get('thumb') and art['thumb'] != parsed_thumb:
+        if art['thumb'] in (art.get('landscape'), art.get('fanart'), fallback):
+            art['thumb'] = parsed_thumb
+            updated = True
+    return updated
 
 
 def get_resume_info_from_library(videoid):
@@ -288,15 +325,13 @@ def parse_art(videoid, item):
 
 def _assign_art(videoid, **kwargs):
     """Assign the art available from Netflix to appropriate Kodi art"""
-    art = {'poster': _best_art([kwargs['poster'], kwargs['fallback']]),
-           'fanart': _best_art([kwargs['fanart'],
-                                kwargs['interesting_moment'],
-                                kwargs['boxart_large'],
-                                kwargs['boxart_small']]),
-           'thumb': ((kwargs['interesting_moment']
-                      if videoid.mediatype in (common.VideoId.EPISODE, common.VideoId.SUPPLEMENTAL) else '')
-                     or kwargs['boxart_large'] or kwargs['boxart_small'])}
-    art['landscape'] = art['thumb']
+    poster = _best_art([kwargs['poster'], kwargs['fallback']])
+    wide_art = _best_art([kwargs['interesting_moment'], kwargs['boxart_large'], kwargs['boxart_small']])
+    thumb = (wide_art if videoid.mediatype in (common.VideoId.EPISODE, common.VideoId.SUPPLEMENTAL) else poster)
+    art = {'poster': poster,
+           'fanart': _best_art([kwargs['fanart'], wide_art]),
+           'thumb': thumb}
+    art['landscape'] = wide_art or thumb
     if videoid.mediatype != common.VideoId.UNSPECIFIED:
         art['clearlogo'] = _best_art([kwargs['clearlogo']])
     return art
