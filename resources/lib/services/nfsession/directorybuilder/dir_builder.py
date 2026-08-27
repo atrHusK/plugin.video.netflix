@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import resources.lib.common as common
 from resources.lib.utils.data_types import merge_data_type, CustomVideoList
+from resources.lib.common.cache_utils import CACHE_COMMON
 from resources.lib.common.exceptions import CacheMiss, InvalidVideoListTypeError
 from resources.lib.common import VideoId
 from resources.lib.globals import G
@@ -87,23 +88,38 @@ class DirectoryBuilder(DirectoryPathRequests):
     @measure_exec_time_decorator(is_immediate=True)
     def get_video_list(self, list_id, menu_data, is_dynamic_id):
         menu_id = menu_data['path'][1]
+        cache_enriched_list = (
+            is_dynamic_id
+            and menu_data.get('initial_menu_id') == 'newAndPopular'
+            and not menu_data.get('no_use_cache'))
+        enriched_cache_id = f'enriched_video_list_{list_id}'
+        video_list = None
+        if cache_enriched_list:
+            try:
+                video_list = G.CACHE.get(CACHE_COMMON, enriched_cache_id)
+            except CacheMiss:
+                pass
         current_contexts = {
             'chosenForYou': ('windowedNewReleases',),
             'currentTitles': ('windowedNewReleases',),
             'mostViewed': ('mostWatched',)
         }
-        if not is_dynamic_id and menu_id == 'continueWatching':
-            video_list = self._browser_continue_watching_list()
-        elif not is_dynamic_id and menu_id in current_contexts:
-            video_list = self._video_list_from_lolomo_category_context(
-                'comingSoon', current_contexts[menu_id], fallback_first=True)
-        else:
-            if not is_dynamic_id:
-                list_id = self.get_loco_list_id_by_context(menu_data['loco_contexts'][0])
-            # pylint: disable=unexpected-keyword-arg
-            video_list = self.req_video_list(list_id, menu_data=menu_data, no_use_cache=menu_data.get('no_use_cache'))
-        if menu_id != 'continueWatching':
-            self._enrich_video_list_art(video_list, include_refs=True)
+        if video_list is None:
+            if not is_dynamic_id and menu_id == 'continueWatching':
+                video_list = self._browser_continue_watching_list()
+            elif not is_dynamic_id and menu_id in current_contexts:
+                video_list = self._video_list_from_lolomo_category_context(
+                    'comingSoon', current_contexts[menu_id], fallback_first=True)
+            else:
+                if not is_dynamic_id:
+                    list_id = self.get_loco_list_id_by_context(menu_data['loco_contexts'][0])
+                # pylint: disable=unexpected-keyword-arg
+                video_list = self.req_video_list(
+                    list_id, menu_data=menu_data, no_use_cache=menu_data.get('no_use_cache'))
+            if menu_id != 'continueWatching':
+                self._enrich_video_list_art(video_list, include_refs=True)
+            if cache_enriched_list:
+                G.CACHE.add(CACHE_COMMON, enriched_cache_id, video_list)
         return build_video_listing(video_list, menu_data,
                                    mylist_items=self.req_mylist_items())
 

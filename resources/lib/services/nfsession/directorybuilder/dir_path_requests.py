@@ -32,7 +32,7 @@ from resources.lib.database.db_utils import TABLE_SESSION
 from resources.lib.utils.api_paths import (VIDEO_LIST_PARTIAL_PATHS, RANGE_PLACEHOLDER, VIDEO_LIST_BASIC_PARTIAL_PATHS,
                                            SEASONS_PARTIAL_PATHS, EPISODES_PARTIAL_PATHS, ART_PARTIAL_PATHS,
                                            ART_SIZE_FHD, ART_SIZE_POSTER, TRAILER_PARTIAL_PATHS,
-                                           build_paths, PATH_REQUEST_SIZE_MAX)
+                                           SUPPLEMENTAL_TYPE_TRAILERS, build_paths, PATH_REQUEST_SIZE_MAX)
 from resources.lib.common import cache_utils
 from resources.lib.globals import G
 from resources.lib.utils.logging import LOG
@@ -42,6 +42,8 @@ GRAPHQL_OP_SEASONS = 'dbc3b274-d4f9-4811-aaf1-d082d3b936f2'
 GRAPHQL_OP_EPISODES = '27b30e4e-871d-46aa-ac8b-244103d2e37d'
 GRAPHQL_OP_SEARCH = '8d902979-56f2-4886-8c16-f8910f6b52ee'
 GRAPHQL_OP_CAROUSEL_PAGE = 'cbe70fd8-c3a1-4e1b-9ab3-d690850ad7f3'
+GRAPHQL_OP_DETAIL_MODAL = '7265187b-c065-4714-9eee-327751c8e215'
+GRAPHQL_OP_DETAIL_MODAL_TRAILERS = '06e30ee5-7983-4fef-8135-5914124b76ad'
 NETFLIX_TITLE_URL = 'https://www.netflix.com/title/{}'
 TITLE_PAGE_GRAPHQL_RE = re.compile(r"netflix\.reactContext\.models\.graphql\s*=\s*JSON\.parse\('(.*?)'\);", re.DOTALL)
 TITLE_PAGE_JSONLD_RE = re.compile(
@@ -725,7 +727,7 @@ def _first_artwork_url(value):
 
 def _supplemental_artwork_url(node):
     for key, value in node.items():
-        if 'artwork' not in key.lower():
+        if not any(name in key.lower() for name in ('artwork', 'boxart', 'storyart', 'still')):
             continue
         image_url = _first_artwork_url(value)
         if image_url:
@@ -748,10 +750,12 @@ def _supplemental_node_to_item(node):
         'creditsOffset': _value(0),
         'watchedToEndOffset': _value(0),
         'watched': _value(False),
-        'runtime': _value(node.get('runtimeSec') or node.get('runtime') or 0),
+        'runtime': _value(node.get('displayRuntimeSec') or node.get('runtimeSec') or node.get('runtime') or 0),
         'trackIds': _value({'trackId': video_id}),
         'requestId': _value('')
     }
+    if node.get('isPlayable') is not None:
+        item['availability'] = _value({'isPlayable': bool(node.get('isPlayable'))})
     synopsis = node.get('synopsis') or node.get('contextualSynopsis') or ''
     if isinstance(synopsis, dict):
         synopsis = synopsis.get('text') or synopsis.get('value') or ''
@@ -794,7 +798,7 @@ def _title_page_graphql_data(content, react_context):
     if not match:
         return {}
     try:
-        graphql_cache = json.loads(match.group(1).encode().decode('unicode_escape'))
+        graphql_cache = json.loads(website.decode_javascript_string(match.group(1)))
     except (TypeError, ValueError, UnicodeDecodeError) as exc:
         LOG.warn('Unable to parse title page GraphQL cache ({})', type(exc).__name__)
         return {}
@@ -1914,6 +1918,18 @@ class DirectoryPathRequests:
         if videoid.mediatype not in (common.VideoId.SHOW, common.VideoId.MOVIE):
             raise InvalidVideoId(f'Cannot request video list supplemental for {videoid}')
         LOG.debug('Requesting video list supplemental of type "{}" for {}', supplemental_type, videoid)
+        if supplemental_type == SUPPLEMENTAL_TYPE_TRAILERS:
+            try:
+                trailer_list = self._req_video_list_supplemental_graphql(videoid)
+                if trailer_list.videos:
+                    return trailer_list
+                LOG.warn('Website GraphQL returned no trailers for {}', videoid)
+                return trailer_list
+            except (KeyError, TypeError, ValueError, req_exceptions.RequestException) as exc:
+                LOG.warn('Website trailer collection lookup failed for {} ({}), trying title page fallback',
+                         videoid, type(exc).__name__)
+                return self._req_video_list_supplemental_title_page(videoid)
+
         path = build_paths(
             ['videos', videoid.value, supplemental_type, {"from": 0, "to": 35}], TRAILER_PARTIAL_PATHS
         )
@@ -1941,29 +1957,8 @@ class DirectoryPathRequests:
                 component_summary={})
 
         def _title_page_fallback():
-            try:
-                response = requests.get(
-                    NETFLIX_TITLE_URL.format(videoid.value),
-                    headers={
-                        'Accept': 'text/html,application/xhtml+xml,application/xml',
-                        'User-Agent': common.get_user_agent(enable_android_mediaflag_fix=True)
-                    },
-                    timeout=8)
-                response.raise_for_status()
-                react_context = website.extract_json(response.content, 'reactContext')
-            except (req_exceptions.RequestException, WebsiteParsingError) as exc:
-                LOG.warn('Title page trailer fallback failed for {} ({})', videoid, type(exc).__name__)
-                return _empty_fallback()
-            graphql_data = _title_page_graphql_data(response.content, react_context)
-            videos = _supplemental_videos_from_graphql_cache(graphql_data, videoid.value)
-            if videos:
-                LOG.debug('Title page trailer fallback found {} supplemental videos for {}', len(videos), videoid)
-                trailer_list = CustomVideoList({'videos': videos})
-                trailer_list.is_supplemental_type = True
-                trailer_list.component_summary = {}
-                return _inherit_parent_metadata(trailer_list)
-            LOG.warn('No title page supplemental videos found for {}', videoid)
-            return _empty_fallback()
+            trailer_list = self._req_video_list_supplemental_title_page(videoid)
+            return _inherit_parent_metadata(trailer_list) if trailer_list.videos else _empty_fallback()
         try:
             path_response = self.nfsession.path_request(path)
             trailer_list = VideoListSupplemental(path_response, 'videos', videoid.value, supplemental_type)
@@ -1976,6 +1971,94 @@ class DirectoryPathRequests:
                 raise
             LOG.warn('Trailer supplemental path returned 404 for {}, trying title page fallback', videoid)
             return _title_page_fallback()
+
+    def _req_video_list_supplemental_graphql(self, videoid):
+        """Load the website's ordered Trailers & More collection."""
+        video_id = int(videoid.value)
+        detail_data = self._post_graphql(
+            'DetailModal',
+            {
+                'artworkContext': {},
+                'checkLinearChannel': True,
+                'fetchPromoVideoOverride': False,
+                'hasPromoVideoOverride': False,
+                'isLiveEpisodic': False,
+                'opaqueImageFormat': 'WEBP',
+                'promoVideoId': 0,
+                'textEvidenceUiContext': 'ODP',
+                'transparentImageFormat': 'WEBP',
+                'unifiedEntityId': f'Video:{video_id}',
+                'videoId': video_id,
+                'videoMerchContext': 'BROWSE',
+                'videoMerchEnabled': False
+            },
+            GRAPHQL_OP_DETAIL_MODAL)
+        entity = (detail_data.get('unifiedEntities') or [None])[0] or {}
+        edges = common.get_path_safe(['supplementalVideosList', 'edges'], entity, False, [])
+        trailer_ids = []
+        for edge in edges:
+            node = edge.get('node') or edge
+            trailer_id = node.get('videoId')
+            if trailer_id and trailer_id not in trailer_ids:
+                trailer_ids.append(trailer_id)
+        if not trailer_ids:
+            return self._empty_supplemental_list()
+
+        trailer_data = self._post_graphql(
+            'DetailModalTrailers',
+            {
+                'artworkContext': {},
+                'opaqueImageFormat': 'WEBP',
+                'videoIds': trailer_ids
+            },
+            GRAPHQL_OP_DETAIL_MODAL_TRAILERS)
+        nodes_by_id = {
+            str(node.get('videoId')): node
+            for node in trailer_data.get('videos') or []
+            if isinstance(node, dict) and node.get('videoId')
+        }
+        videos = OrderedDict()
+        for trailer_id in trailer_ids:
+            item = _supplemental_node_to_item(nodes_by_id.get(str(trailer_id), {}))
+            if item:
+                videos[item[0]] = item[1]
+        trailer_list = CustomVideoList({'videos': videos})
+        trailer_list.is_supplemental_type = True
+        trailer_list.component_summary = {}
+        LOG.debug('Website GraphQL returned {} trailers for {}', len(videos), videoid)
+        return trailer_list
+
+    def _req_video_list_supplemental_title_page(self, videoid):
+        try:
+            response = self.nfsession.session.get(
+                NETFLIX_TITLE_URL.format(videoid.value),
+                headers={
+                    'Accept': 'text/html,application/xhtml+xml,application/xml',
+                    'User-Agent': common.get_user_agent(enable_android_mediaflag_fix=True)
+                },
+                timeout=8)
+            response.raise_for_status()
+            react_context = website.extract_json(response.content, 'reactContext')
+        except (req_exceptions.RequestException, WebsiteParsingError) as exc:
+            LOG.warn('Title page trailer fallback failed for {} ({})', videoid, type(exc).__name__)
+            return self._empty_supplemental_list()
+        graphql_data = _title_page_graphql_data(response.content, react_context)
+        videos = _supplemental_videos_from_graphql_cache(graphql_data, videoid.value)
+        if not videos:
+            LOG.warn('No title page supplemental videos found for {}', videoid)
+            return self._empty_supplemental_list()
+        LOG.debug('Title page trailer fallback found {} supplemental videos for {}', len(videos), videoid)
+        trailer_list = CustomVideoList({'videos': videos})
+        trailer_list.is_supplemental_type = True
+        trailer_list.component_summary = {}
+        return trailer_list
+
+    @staticmethod
+    def _empty_supplemental_list():
+        trailer_list = CustomVideoList({'videos': OrderedDict()})
+        trailer_list.is_supplemental_type = True
+        trailer_list.component_summary = {}
+        return trailer_list
 
     @cache_utils.cache_output(cache_utils.CACHE_COMMON, identify_from_kwarg_name='chunked_video_list',
                               ttl=900, ignore_self_class=True)
@@ -2029,28 +2112,28 @@ class DirectoryPathRequests:
         metadata_by_video = {video_id: {} for video_id in video_ids}
         title_metadata_by_video = {}
         max_workers = min(SEARCH_TITLE_PAGE_METADATA_WORKERS, len(video_ids))
-        with (ThreadPoolExecutor(max_workers=max_workers) as metadata_executor,
-              ThreadPoolExecutor(max_workers=max_workers) as title_executor):
-            metadata_futures = {
-                metadata_executor.submit(self._search_metadata_for_video, video_id): video_id
-                for video_id in video_ids
-            }
-            title_futures = {
-                title_executor.submit(_search_title_page_metadata, video_id): video_id
-                for video_id in video_ids
-            }
-            for future in as_completed(metadata_futures):
-                video_id = metadata_futures[future]
-                try:
-                    metadata_by_video[video_id] = future.result()
-                except Exception as exc:  # pylint: disable=broad-except
-                    LOG.debug('Search metadata worker failed ({})', type(exc).__name__)
-            for future in as_completed(title_futures):
-                video_id = title_futures[future]
-                try:
-                    title_metadata_by_video[video_id] = future.result()
-                except Exception as exc:  # pylint: disable=broad-except
-                    LOG.debug('Search title metadata worker failed ({})', type(exc).__name__)
+        with ThreadPoolExecutor(max_workers=max_workers) as metadata_executor:
+            with ThreadPoolExecutor(max_workers=max_workers) as title_executor:
+                metadata_futures = {
+                    metadata_executor.submit(self._search_metadata_for_video, video_id): video_id
+                    for video_id in video_ids
+                }
+                title_futures = {
+                    title_executor.submit(_search_title_page_metadata, video_id): video_id
+                    for video_id in video_ids
+                }
+                for future in as_completed(metadata_futures):
+                    video_id = metadata_futures[future]
+                    try:
+                        metadata_by_video[video_id] = future.result()
+                    except Exception as exc:  # pylint: disable=broad-except
+                        LOG.debug('Search metadata worker failed ({})', type(exc).__name__)
+                for future in as_completed(title_futures):
+                    video_id = title_futures[future]
+                    try:
+                        title_metadata_by_video[video_id] = future.result()
+                    except Exception as exc:  # pylint: disable=broad-except
+                        LOG.debug('Search title metadata worker failed ({})', type(exc).__name__)
         for video_id in video_ids:
             metadata = _merge_title_page_metadata(
                 metadata_by_video[video_id], title_metadata_by_video.get(video_id))

@@ -145,14 +145,14 @@ class AddonActionExecutor:
                                                      'video_id_dict': video_id_dict,
                                                      'supplemental_type': SUPPLEMENTAL_TYPE_TRAILERS
                                                  })
-        if list_data:
+        if list_data or self._direct_trailer_url(videoid):
             url = common.build_url(['supplemental'],
                                    params={'video_id_dict': dumps(video_id_dict),
                                            'supplemental_type': SUPPLEMENTAL_TYPE_TRAILERS},
                                    mode=G.MODE_DIRECTORY)
             common.container_update(url)
-        else:
-            ui.show_notification(common.get_local_string(30111))
+            return
+        ui.show_notification(common.get_local_string(30111))
 
     @common.inject_video_id(path_offset=1)
     @measure_exec_time_decorator()
@@ -163,14 +163,27 @@ class AddonActionExecutor:
             from resources.lib.navigation.player import _play  # pylint: disable=protected-access,import-outside-toplevel
             _play(trailer_videoid, False)
             return
+        self._resolve_direct_trailer(videoid)
+
+    @common.inject_video_id(path_offset=1)
+    @measure_exec_time_decorator()
+    def play_direct_trailer(self, videoid):
+        """Resolve only the direct metadata trailer selected from the trailer menu."""
+        self._resolve_direct_trailer(videoid)
+
+    def _resolve_direct_trailer(self, videoid):
         trailer_url = self._direct_trailer_url(videoid)
         if trailer_url:
-            list_item = xbmcgui.ListItem(path=trailer_url, offscreen=True)
+            title = xbmc.getInfoLabel('ListItem.Title') or xbmc.getInfoLabel('ListItem.Label')
+            list_item = xbmcgui.ListItem(title, path=trailer_url, offscreen=True)
+            if title:
+                list_item.setInfo('video', {'Title': title})
             list_item.setProperty('isPlayable', 'true')
             list_item.setContentLookup(False)
             xbmcplugin.setResolvedUrl(handle=G.PLUGIN_HANDLE, succeeded=True, listitem=list_item)
-            return
+            return True
         xbmcplugin.setResolvedUrl(handle=G.PLUGIN_HANDLE, succeeded=False, listitem=xbmcgui.ListItem())
+        return False
 
     @staticmethod
     def _first_trailer_videoid(videoid):

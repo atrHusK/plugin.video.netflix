@@ -7,6 +7,7 @@
     SPDX-License-Identifier: MIT
     See LICENSES/MIT.md for more information.
 """
+import xbmcgui
 import xbmcplugin
 
 import resources.lib.common as common
@@ -241,6 +242,19 @@ class Directory:
             'supplemental_type': self.params['supplemental_type']
         }
         dir_items, extra_data = common.make_call('get_video_list_supplemental', call_args)
+        if not dir_items:
+            videoid = common.VideoId.from_dict(call_args['video_id_dict'])
+            infos, art = common.make_call('get_videoid_info', videoid)
+            if infos.get('Trailer', '').startswith('http'):
+                title = infos.get('Title') or common.get_local_string(30179)
+                list_item = xbmcgui.ListItem(title, offscreen=True)
+                infos['Title'] = title
+                list_item.setInfo('video', infos)
+                list_item.setArt(art)
+                list_item.setProperty('isPlayable', 'true')
+                list_item.setContentLookup(False)
+                play_url = common.build_url(['play_direct_trailer'], videoid=videoid, mode=G.MODE_ACTION)
+                dir_items = [(play_url, list_item, False)]
 
         finalize_directory(dir_items, menu_data.get('content_type', G.CONTENT_SHOW),
                            title=get_title(menu_data, extra_data))
