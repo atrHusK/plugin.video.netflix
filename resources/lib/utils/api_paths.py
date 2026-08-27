@@ -112,7 +112,9 @@ INFO_MAPPINGS = [
     ('Duration', ['runtime', 'value']),
     # 'trailer' add the trailer button support to 'Information' window of ListItem, can be used from custom Kodi skins
     #   to reproduce a background promo video when a ListItem is selected
+    ('Trailer', ['trailerUrl', 'value']),
     ('Trailer', ['promoVideo', 'value', 'id']),
+    ('Trailer', ['promoVideo', 'value', 'videoId']),
     # ListItem.DateAdded: Removed for now, the actual use of this property for tvshow ListItem type is not clear,
     #                     the documentation says "date of adding in the library", but kodi developers say that
     #                     is used as the latest update date
@@ -124,8 +126,7 @@ INFO_TRANSFORMATIONS = {
     'Season': lambda s_value: _convert_season(s_value),
     'Rating': lambda r: r / 10,
     'PlayCount': lambda w: int(w),
-    'Trailer': lambda video_id: common.build_url(pathitems=[common.VideoId.SUPPLEMENTAL, str(video_id)],
-                                                 mode=G.MODE_PLAY),
+    'Trailer': lambda video_id: _convert_trailer(video_id),
     'DateAdded': lambda ats: common.strf_timestamp(int(ats / 1000), '%Y-%m-%d %H:%M:%S')
 }
 
@@ -142,6 +143,13 @@ def _convert_season(value):
         return value
     # isdigit is needed to filter out non numeric characters from 'shortName' key
     return int(''.join([n for n in value if n.isdigit()] or '0'))
+
+
+def _convert_trailer(value):
+    if isinstance(value, str) and (value.startswith('http') or value.startswith('plugin://')):
+        return value
+    return common.build_url(pathitems=[common.VideoId.SUPPLEMENTAL, str(value)],
+                            mode=G.MODE_PLAY)
 
 
 def build_paths(base_path, partial_paths):

@@ -55,7 +55,11 @@ def get_info(videoid, item, raw_data, profile_language_code='', delayed_db_op=Fa
         cache_entry = G.CACHE.get(CACHE_INFOLABELS, cache_identifier)
         infos = cache_entry['infos']
         quality_infos = cache_entry['quality_infos']
-        if _refresh_missing_plot(infos, item):
+        updated = False
+        updated = _refresh_missing_plot(infos, item) or updated
+        updated = _refresh_missing_atomic_infos(infos, item, ('Trailer',)) or updated
+        updated = _refresh_missing_referenced_infos(infos, item, raw_data) or updated
+        if updated:
             G.CACHE.add(CACHE_INFOLABELS, cache_identifier, {'infos': infos, 'quality_infos': quality_infos},
                         delayed_db_op=delayed_db_op)
     except CacheMiss:
@@ -85,10 +89,36 @@ def _refresh_missing_plot(infos, item):
     return True
 
 
+def _refresh_missing_referenced_infos(infos, item, raw_data):
+    if not item or not raw_data:
+        return False
+    updated = False
+    referenced_infos = _parse_referenced_infos(item, raw_data)
+    for key, value in referenced_infos.items():
+        if value and not infos.get(key):
+            infos[key] = value
+            updated = True
+    return updated
+
+
+def _refresh_missing_atomic_infos(infos, item, targets):
+    if not item:
+        return False
+    updated = False
+    atomic_infos = _parse_atomic_infos(item)
+    for key in targets:
+        value = atomic_infos.get(key)
+        if value and not infos.get(key):
+            infos[key] = value
+            updated = True
+    return updated
+
+
 def add_info_list_item(list_item: ListItemW, videoid, item, raw_data, is_in_mylist, common_data, art_item=None,
                        is_in_remind_me=False):
     """Add infolabels and art to a ListItem"""
     infos, quality_infos = get_info(videoid, item, raw_data, delayed_db_op=True, common_data=common_data)
+    _add_trailer_fallback(infos, videoid)
     list_item.addStreamInfoFromDict(quality_infos)
     if is_in_mylist and common_data.get('mylist_titles_color'):
         # Highlight ListItem title when the videoid is contained in "My list"
@@ -102,6 +132,12 @@ def add_info_list_item(list_item: ListItemW, videoid, item, raw_data, is_in_myli
     list_item.setInfo('video', infos)
     list_item.setArt(get_art(videoid, art_item or item or {}, common_data['profile_language_code'],
                              delayed_db_op=True))
+
+
+def _add_trailer_fallback(infos, videoid):
+    if infos.get('Trailer') or videoid.mediatype not in (common.VideoId.MOVIE, common.VideoId.SHOW):
+        return
+    infos['Trailer'] = common.build_url(['play_trailer'], videoid=videoid, mode=G.MODE_ACTION)
 
 
 def _add_supplemental_plot_info(infos, item, common_data):

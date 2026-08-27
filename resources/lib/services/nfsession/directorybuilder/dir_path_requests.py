@@ -41,6 +41,8 @@ GRAPHQL_OP_EPISODES = '27b30e4e-871d-46aa-ac8b-244103d2e37d'
 GRAPHQL_OP_SEARCH = '8d902979-56f2-4886-8c16-f8910f6b52ee'
 NETFLIX_TITLE_URL = 'https://www.netflix.com/title/{}'
 TITLE_PAGE_GRAPHQL_RE = re.compile(r"netflix\.reactContext\.models\.graphql\s*=\s*JSON\.parse\('(.*?)'\);", re.DOTALL)
+TITLE_PAGE_JSONLD_RE = re.compile(
+    r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', re.DOTALL)
 LOCO_ROOT_ID_RE = re.compile(r'NES_[A-Za-z0-9_]+_p_\d+')
 LOCO_ROOT_CANDIDATE_RE = re.compile(r'NES_[A-Za-z0-9_]+')
 LOCO_ROW_RANGE = {'from': 0, 'to': 50}
@@ -68,16 +70,205 @@ BROWSER_LOCO_SUMMARY_FIELDS = [
 BROWSER_LOCO_CURRENT_FIELDS = ['hasAudioDescription', 'summary']
 BROWSER_LOCO_CONTINUE_FIELDS = ['bookmarkPosition', 'runtime', 'summary', 'title']
 BROWSER_LOCO_REFERENCE_FIELDS = ['availability', 'episodeCount', 'inRemindMeList', 'queue', 'summary']
+BROWSER_LOCO_METADATA_FIELDS = BROWSER_LOCO_REFERENCE_FIELDS + [
+    'title', 'synopsis', 'runtime', 'seasonCount', 'bookmarkPosition',
+    'creditsOffset', 'watched', 'delivery', 'trackIds', 'userRating',
+    'maturity', 'releaseYear', 'promoVideo'
+]
+BROWSER_LOCO_PERSON_FIELDS = ['genres', 'tags', 'creators', 'directors', 'cast']
 BROWSER_GENRE_SUBGENRE_FIELDS = ['id', 'name', 'unifiedEntityId']
 BROWSER_LOCO_DIRECT_RANGE = {'from': 0, 'to': PATH_REQUEST_SIZE_MAX}
 BROWSER_LOCO_HOME_ROW_RANGE = {'from': 4, 'to': 50}
 BROWSER_LOCO_HOME_VISIBLE_RANGE = {'from': 0, 'to': 8}
 BROWSER_LOCO_CONTINUE_LAZY_RANGE = {'from': 8, 'to': 100}
 SEARCH_GRAPHQL_PAGE_SIZE = 48
+METADATA_REFERENCE_KEYS = {
+    'cast': ('people', ('cast', 'actors', 'actor', 'starring', 'starringActors')),
+    'directors': ('people', ('directors', 'director')),
+    'creators': ('people', ('creators', 'creator', 'writers', 'writer')),
+    'genres': ('genres', ('genres', 'genre', 'tags'))
+}
 
 
 def _value(value):
     return {'value': value}
+
+
+def _has_reference_entries(item, source):
+    refs = item.get(source, {}) if isinstance(item, dict) else {}
+    if not isinstance(refs, dict):
+        return False
+    return any(common.is_numeric(key) for key in refs)
+
+
+def _metadata_names_from_value(value):
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [name.strip() for name in value.split(',') if name.strip()]
+    if isinstance(value, list):
+        names = []
+        for item in value:
+            names.extend(_metadata_names_from_value(item))
+        return names
+    if not isinstance(value, dict):
+        return []
+    for key in ('name', 'fullName', 'displayName', 'title'):
+        name = value.get(key)
+        if isinstance(name, str) and name.strip():
+            return [name.strip()]
+        if isinstance(name, dict):
+            nested_names = _metadata_names_from_value(name.get('value') or name)
+            if nested_names:
+                return nested_names
+    for key in ('value', 'person', 'node'):
+        nested_names = _metadata_names_from_value(value.get(key))
+        if nested_names:
+            return nested_names
+    if 'edges' in value:
+        return _metadata_names_from_value(value.get('edges'))
+    if all(common.is_numeric(key) for key in value):
+        names = []
+        for item in value.values():
+            names.extend(_metadata_names_from_value(item))
+        return names
+    return []
+
+
+def _metadata_names(metadata, keys):
+    names = []
+    for key in keys:
+        names.extend(_metadata_names_from_value(metadata.get(key)))
+    unique_names = []
+    seen = set()
+    for name in names:
+        normalized = name.strip()
+        if not normalized or normalized.lower() in seen:
+            continue
+        seen.add(normalized.lower())
+        unique_names.append(normalized)
+    return unique_names
+
+
+def _metadata_has_reference_names(metadata):
+    if not isinstance(metadata, dict):
+        return False
+    for _source, (_target, keys) in METADATA_REFERENCE_KEYS.items():
+        if _metadata_names(metadata, keys):
+            return True
+    return False
+
+
+def _metadata_has_trailer(metadata):
+    return bool(_metadata_trailer_id(metadata) or _metadata_trailer_url(metadata))
+
+
+def _title_page_jsonld_data(content):
+    from html import unescape
+    html_text = content.decode('utf-8', 'replace') if isinstance(content, bytes) else str(content)
+    for match in TITLE_PAGE_JSONLD_RE.finditer(html_text):
+        try:
+            jsonld_data = json.loads(unescape(match.group(1)))
+        except (TypeError, ValueError) as exc:
+            LOG.debug('Unable to parse title page JSON-LD ({})', type(exc).__name__)
+            continue
+        candidates = jsonld_data if isinstance(jsonld_data, list) else [jsonld_data]
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            if candidate.get('@type') in ('Movie', 'TVSeries') or candidate.get('actors') or candidate.get('creators'):
+                return candidate
+    return {}
+
+
+def _metadata_from_title_page(video_id):
+    try:
+        response = requests.get(
+            NETFLIX_TITLE_URL.format(video_id),
+            headers={
+                'Accept': 'text/html,application/xhtml+xml,application/xml',
+                'User-Agent': common.get_user_agent(enable_android_mediaflag_fix=True)
+            },
+            timeout=8)
+        response.raise_for_status()
+    except req_exceptions.RequestException as exc:
+        LOG.debug('Title page metadata fallback failed for {} ({})', video_id, type(exc).__name__)
+        return {}
+    return _title_page_jsonld_data(response.content)
+
+
+def metadata_with_title_page_fallback(video_id, metadata_video=None):
+    """Return metadata enriched with public title page JSON-LD people/trailer fields."""
+    metadata_video = dict(metadata_video or {})
+    if _metadata_has_reference_names(metadata_video) and _metadata_has_trailer(metadata_video):
+        return metadata_video
+    title_page_metadata = _metadata_from_title_page(video_id)
+    if not title_page_metadata:
+        return metadata_video
+    for key in ('actors', 'directors', 'creators', 'genre', 'trailer'):
+        if key in title_page_metadata and key not in metadata_video:
+            metadata_video[key] = title_page_metadata[key]
+    return metadata_video
+
+
+def _metadata_trailer_id(metadata_video):
+    promo_video = metadata_video.get('promoVideo')
+    if isinstance(promo_video, dict):
+        promo_value = promo_video.get('value') if isinstance(promo_video.get('value'), dict) else promo_video
+        trailer_id = promo_value.get('id') or promo_value.get('videoId')
+        if trailer_id:
+            return trailer_id
+    trailer_id = metadata_video.get('merchedVideoId') or metadata_video.get('promoVideoId')
+    return trailer_id
+
+
+def _metadata_trailer_url(metadata_video):
+    trailer = metadata_video.get('trailer')
+    if isinstance(trailer, dict):
+        trailer_url = trailer.get('contentUrl') or trailer.get('url')
+        if trailer_url:
+            return trailer_url
+    return metadata_video.get('trailerUrl') or metadata_video.get('previewUrl')
+
+
+def _add_metadata_trailer(item, metadata_video):
+    if item.get('promoVideo') or item.get('trailerUrl'):
+        return
+    trailer_id = _metadata_trailer_id(metadata_video)
+    if trailer_id:
+        item['promoVideo'] = _value({'id': trailer_id})
+        return
+    trailer_url = _metadata_trailer_url(metadata_video)
+    if trailer_url:
+        item['trailerUrl'] = _value(trailer_url)
+
+
+def _reference_id(prefix, name, index):
+    safe_name = re.sub(r'[^A-Za-z0-9]+', '_', name).strip('_').lower()
+    return f'{prefix}_{index}_{safe_name}' if safe_name else f'{prefix}_{index}'
+
+
+def _add_metadata_references(path_response, item, source, target, names):
+    if not names or _has_reference_entries(item, source):
+        return
+    target_data = path_response.setdefault(target, {})
+    refs = item.setdefault(source, {})
+    for index, name in enumerate(names[:10]):
+        ref_id = _reference_id(f'metadata_{source}', name, index)
+        target_data.setdefault(ref_id, {'name': _value(name)})
+        refs[str(index)] = {'$type': 'ref', 'value': [target, ref_id]}
+
+
+def normalize_metadata_references(path_response, video_id, metadata_video, item=None):
+    """Copy metadata people/genre fields into the JSON graph reference shape."""
+    if not isinstance(metadata_video, dict):
+        return
+    item = item or path_response.get('videos', {}).get(str(video_id))
+    if not isinstance(item, dict):
+        return
+    for source, (target, keys) in METADATA_REFERENCE_KEYS.items():
+        _add_metadata_references(path_response, item, source, target, _metadata_names(metadata_video, keys))
+    _add_metadata_trailer(item, metadata_video)
 
 
 def _summary(video_id, title, video_type, number=None, length=None):
@@ -425,8 +616,12 @@ def _normalize_browser_list_lengths(path_response):
                 del list_data[key]
 
 
-def _browser_reference_paths(reference_path):
-    return [reference_path + [BROWSER_LOCO_REFERENCE_FIELDS]]
+def _browser_reference_paths(reference_path, include_metadata=False):
+    fields = BROWSER_LOCO_METADATA_FIELDS if include_metadata else BROWSER_LOCO_REFERENCE_FIELDS
+    paths = [reference_path + [fields]]
+    if include_metadata:
+        paths.append(reference_path + [BROWSER_LOCO_PERSON_FIELDS, {'from': 0, 'to': 10}, ['id', 'name']])
+    return paths
 
 
 def _set_browser_boxart(video, item_summary):
@@ -723,9 +918,13 @@ class DirectoryPathRequests:
             'summary': _summary(videoid.seasonid, season_data.get('title') or '', 'season', season_number, len(episodes)),
             'title': _value(season_data.get('title') or '')
         }
+        path_response = {'videos': {videoid.tvshowid: tvshow}, 'seasons': {videoid.seasonid: season},
+                         'episodes': episodes}
+        for episode_id, episode in episodes.items():
+            normalize_metadata_references(path_response, episode_id, metadata_by_id.get(str(episode_id)), episode)
         return SimpleNamespace(
             perpetual_range_selector=None,
-            data={'videos': {videoid.tvshowid: tvshow}, 'seasons': {videoid.seasonid: season}, 'episodes': episodes},
+            data=path_response,
             videoid=videoid,
             tvshow=tvshow,
             season=season,
@@ -784,6 +983,17 @@ class DirectoryPathRequests:
         self.nfsession.auth_url = auth_url
         return self._post_browser_path_evaluator(paths, 'https://www.netflix.com/browse')
 
+    def _post_browser_path_evaluator_with_fallback(self, paths, fallback_paths, referer, description):
+        try:
+            return self._post_browser_path_evaluator(paths, referer)
+        except req_exceptions.HTTPError as exc:
+            status_code = getattr(exc.response, 'status_code', None)
+            if status_code not in (404, 412):
+                raise
+            LOG.warn('{} metadata fields request returned {}; retrying light fields',
+                     description, status_code)
+            return self._post_browser_path_evaluator(fallback_paths, referer)
+
     def _post_browser_path_evaluator(self, paths, referer):
         api_url = G.LOCAL_DB.get_value(
             'api_endpoint_url',
@@ -824,7 +1034,8 @@ class DirectoryPathRequests:
         _normalize_browser_video_fields(path_response)
         return path_response
 
-    def _browser_loco_paths(self, root_path, include_genre_paths=False, include_full_rows=False):
+    def _browser_loco_paths(self, root_path, include_genre_paths=False, include_full_rows=False,
+                            include_metadata=False):
         paths = [
             root_path + [['componentSummary', 'debugRequest']],
             root_path + [BROWSER_LOCO_ROW_KEYS, 'componentSummary'],
@@ -842,25 +1053,28 @@ class DirectoryPathRequests:
         if include_full_rows:
             paths.append(root_path + [BROWSER_LOCO_ROW_KEYS, BROWSER_LOCO_DIRECT_RANGE, 'itemSummary'])
             paths.extend(_browser_reference_paths(
-                root_path + [BROWSER_LOCO_ROW_KEYS, BROWSER_LOCO_DIRECT_RANGE, 'reference']))
+                root_path + [BROWSER_LOCO_ROW_KEYS, BROWSER_LOCO_DIRECT_RANGE, 'reference'],
+                include_metadata=include_metadata))
         if include_genre_paths:
             paths.insert(0, root_path[:-1] + [['name', 'trackIds']])
         return paths
 
-    def _browser_video_list_paths(self, list_id):
+    def _browser_video_list_paths(self, list_id, include_metadata=False):
         paths = [
             ['lists', list_id, ['componentSummary', 'debugRequest']],
             ['lists', list_id, 'page', 0, LOCO_PAGE_RANGE, 'itemSummary']
         ]
-        paths.extend(_browser_reference_paths(['lists', list_id, 'page', 0, LOCO_PAGE_RANGE, 'reference']))
+        paths.extend(_browser_reference_paths(['lists', list_id, 'page', 0, LOCO_PAGE_RANGE, 'reference'],
+                                              include_metadata=include_metadata))
         return paths
 
-    def _browser_video_list_full_paths(self, list_id):
+    def _browser_video_list_full_paths(self, list_id, include_metadata=False):
         paths = [
             ['lists', list_id, ['componentSummary', 'debugRequest']],
             ['lists', list_id, BROWSER_LOCO_DIRECT_RANGE, 'itemSummary']
         ]
-        paths.extend(_browser_reference_paths(['lists', list_id, BROWSER_LOCO_DIRECT_RANGE, 'reference']))
+        paths.extend(_browser_reference_paths(['lists', list_id, BROWSER_LOCO_DIRECT_RANGE, 'reference'],
+                                              include_metadata=include_metadata))
         return paths
 
     def _req_browser_lolomo_category(self, category_name):
@@ -879,9 +1093,11 @@ class DirectoryPathRequests:
 
     def _browser_video_list_by_id(self, list_id):
         self._browse_html_and_auth_url()
-        path_response = self._post_browser_path_evaluator(
+        path_response = self._post_browser_path_evaluator_with_fallback(
+            self._browser_video_list_paths(str(list_id), include_metadata=True),
             self._browser_video_list_paths(str(list_id)),
-            'https://www.netflix.com/browse')
+            'https://www.netflix.com/browse',
+            f'Browser list {list_id}')
         return VideoList(path_response, str(list_id))
 
     def _browser_mylist_loco_response(self, root_id, auth_url, row_range):
@@ -915,26 +1131,38 @@ class DirectoryPathRequests:
                 return str(list_id), self._loco_row_key_for_list(root_response, root_id, list_id)
         raise InvalidVideoListTypeError('No current LoCo My List queue available')
 
-    def _browser_mylist_loco_row_paths(self, root_id, row_key, use_direct_range):
+    def _browser_mylist_loco_row_paths(self, root_id, row_key, use_direct_range, include_metadata=False):
         item_range = BROWSER_LOCO_DIRECT_RANGE if use_direct_range else LOCO_PAGE_RANGE
         row_path = ['locos', root_id, row_key]
         if use_direct_range:
             return [
                 row_path + ['componentSummary'],
                 row_path + [item_range, 'itemSummary'],
-                *_browser_reference_paths(row_path + [item_range, 'reference'])
+                *_browser_reference_paths(row_path + [item_range, 'reference'],
+                                          include_metadata=include_metadata)
             ]
         return [
             row_path + ['componentSummary'],
             row_path + ['page', 0, item_range, 'itemSummary'],
-            *_browser_reference_paths(row_path + ['page', 0, item_range, 'reference'])
+            *_browser_reference_paths(row_path + ['page', 0, item_range, 'reference'],
+                                      include_metadata=include_metadata)
         ]
 
     def _browser_mylist_loco_video_list(self, root_id, row_key, list_id, auth_url):
         for use_direct_range in (True, False):
+            metadata_paths = self._browser_mylist_loco_row_paths(root_id, row_key, use_direct_range,
+                                                                 include_metadata=True)
+            light_paths = self._browser_mylist_loco_row_paths(root_id, row_key, use_direct_range)
             try:
-                path_response = self._post_current_loco_paths(
-                    self._browser_mylist_loco_row_paths(root_id, row_key, use_direct_range), auth_url)
+                try:
+                    path_response = self._post_current_loco_paths(metadata_paths, auth_url)
+                except req_exceptions.HTTPError as exc:
+                    status_code = getattr(exc.response, 'status_code', None)
+                    if status_code not in (404, 412):
+                        raise
+                    LOG.warn('My List LoCo metadata fields request returned {}; retrying light fields',
+                             status_code)
+                    path_response = self._post_current_loco_paths(light_paths, auth_url)
                 if str(list_id) in path_response.get('lists', {}):
                     return VideoList(path_response, str(list_id))
             except req_exceptions.HTTPError as exc:
@@ -945,10 +1173,22 @@ class DirectoryPathRequests:
         raise InvalidVideoListTypeError('No current LoCo My List content available')
 
     def _browser_mylist_direct_video_list(self, list_id, auth_url):
-        for paths in (self._browser_video_list_full_paths(str(list_id)),
-                      self._browser_video_list_paths(str(list_id))):
+        for paths, fallback_paths in (
+                (self._browser_video_list_full_paths(str(list_id), include_metadata=True),
+                 self._browser_video_list_full_paths(str(list_id))),
+                (self._browser_video_list_paths(str(list_id), include_metadata=True),
+                 self._browser_video_list_paths(str(list_id)))):
             try:
-                return VideoList(self._post_current_loco_paths(paths, auth_url), str(list_id))
+                try:
+                    path_response = self._post_current_loco_paths(paths, auth_url)
+                except req_exceptions.HTTPError as exc:
+                    status_code = getattr(exc.response, 'status_code', None)
+                    if status_code not in (404, 412):
+                        raise
+                    LOG.warn('My List direct metadata fields request returned {}; retrying light fields',
+                             status_code)
+                    path_response = self._post_current_loco_paths(fallback_paths, auth_url)
+                return VideoList(path_response, str(list_id))
             except req_exceptions.HTTPError as exc:
                 if getattr(exc.response, 'status_code', None) not in (404, 412):
                     raise
@@ -974,18 +1214,25 @@ class DirectoryPathRequests:
 
     def _browser_lolomo_video_list_by_id(self, category_name, list_id):
         self._browse_html_and_auth_url()
-        path_response = self._post_browser_path_evaluator(
+        path_response = self._post_browser_path_evaluator_with_fallback(
+            self._browser_loco_paths(['lolomoByCategory', category_name], include_full_rows=True,
+                                     include_metadata=True),
             self._browser_loco_paths(['lolomoByCategory', category_name], include_full_rows=True),
-            'https://www.netflix.com/latest')
+            'https://www.netflix.com/latest',
+            f'LoLoMo category {category_name}')
         if str(list_id) not in path_response.get('lists', {}):
             raise InvalidVideoListTypeError(f'No LoLoMo category list with id {list_id}')
         return VideoList(path_response, str(list_id))
 
     def _browser_genre_video_list_by_id(self, genre_id, list_id):
         self._browse_html_and_auth_url()
-        path_response = self._post_browser_path_evaluator(
-            self._browser_loco_paths(['genres', int(genre_id), 'rw'], include_genre_paths=True, include_full_rows=True),
-            f'https://www.netflix.com/browse/genre/{genre_id}')
+        path_response = self._post_browser_path_evaluator_with_fallback(
+            self._browser_loco_paths(['genres', int(genre_id), 'rw'], include_genre_paths=True,
+                                     include_full_rows=True, include_metadata=True),
+            self._browser_loco_paths(['genres', int(genre_id), 'rw'], include_genre_paths=True,
+                                     include_full_rows=True),
+            f'https://www.netflix.com/browse/genre/{genre_id}',
+            f'Genre {genre_id}')
         if str(list_id) not in path_response.get('lists', {}):
             raise InvalidVideoListTypeError(f'No genre list with id {list_id}')
         return VideoList(path_response, str(list_id))
@@ -1274,6 +1521,21 @@ class DirectoryPathRequests:
         path = build_paths(
             ['videos', videoid.value, supplemental_type, {"from": 0, "to": 35}], TRAILER_PARTIAL_PATHS
         )
+        parent_metadata = {'loaded': False, 'value': None}
+
+        def _get_parent_metadata():
+            if not parent_metadata['loaded']:
+                parent_metadata['loaded'] = True
+                parent_metadata['value'] = self._metadata_for_video(videoid.value, 'Parent supplemental')
+            return parent_metadata['value']
+
+        def _inherit_parent_metadata(video_list):
+            metadata_video = _get_parent_metadata()
+            if metadata_video:
+                for supplemental_id, supplemental_video in video_list.videos.items():
+                    normalize_metadata_references(video_list.data, supplemental_id, metadata_video, supplemental_video)
+            return video_list
+
         def _empty_fallback():
             return SimpleNamespace(
                 perpetual_range_selector=None,
@@ -1303,14 +1565,14 @@ class DirectoryPathRequests:
                 trailer_list = CustomVideoList({'videos': videos})
                 trailer_list.is_supplemental_type = True
                 trailer_list.component_summary = {}
-                return trailer_list
+                return _inherit_parent_metadata(trailer_list)
             LOG.warn('No title page supplemental videos found for {}', videoid)
             return _empty_fallback()
         try:
             path_response = self.nfsession.path_request(path)
             trailer_list = VideoListSupplemental(path_response, 'videos', videoid.value, supplemental_type)
             if trailer_list.videos:
-                return trailer_list
+                return _inherit_parent_metadata(trailer_list)
             LOG.warn('Trailer supplemental response was empty for {}, trying title page fallback', videoid)
             return _title_page_fallback()
         except req_exceptions.HTTPError as exc:
@@ -1361,6 +1623,7 @@ class DirectoryPathRequests:
             _search_graphql_variables(search_term),
             GRAPHQL_OP_SEARCH)
         videos = OrderedDict()
+        path_response = {'videos': videos}
         page = data.get('page') or {}
         sections = (page.get('sections') or {}).get('edges') or []
         for section in sections:
@@ -1374,20 +1637,21 @@ class DirectoryPathRequests:
                     video_id, video_data = item
                     videos.setdefault(video_id, video_data)
         for video_id, video_data in list(videos.items()):
-            metadata_video = self._metadata_for_search_video(video_id)
+            metadata_video = self._metadata_for_video(video_id, 'Search')
             if metadata_video:
                 videos[video_id] = _merge_search_metadata_video(video_data, metadata_video)
-        return CustomVideoList({'videos': videos})
+                normalize_metadata_references(path_response, video_id, metadata_video, videos[video_id])
+        return CustomVideoList(path_response)
 
-    def _metadata_for_search_video(self, video_id):
+    def _metadata_for_video(self, video_id, context):
         try:
             metadata_data = self.nfsession.get_safe(
                 endpoint='metadata',
                 params={'movieid': video_id, '_': int(time.time() * 1000)})
-            return metadata_data.get('video') or {}
+            return metadata_with_title_page_fallback(video_id, metadata_data.get('video') or {})
         except (MetadataNotAvailable, KeyError, TypeError, req_exceptions.RequestException):
-            LOG.warn('Search metadata enrichment skipped for video {}', video_id)
-            return {}
+            LOG.warn('{} metadata enrichment skipped for video {}', context, video_id)
+            return metadata_with_title_page_fallback(video_id)
 
     def req_subgenres(self, genre_id):
         """Retrieve sub-genres for the given genre"""

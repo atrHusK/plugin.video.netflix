@@ -21,6 +21,8 @@ from resources.lib.common.exceptions import (NotLoggedInError, MissingCredential
                                              InvalidProfilesError, ErrorMsgNoReport)
 from resources.lib.globals import G
 from resources.lib.kodi import ui
+from resources.lib.services.nfsession.directorybuilder.dir_path_requests import (metadata_with_title_page_fallback,
+                                                                                normalize_metadata_references)
 from resources.lib.services.nfsession.session.path_requests import SessionPathRequests
 from resources.lib.utils import cookies
 from resources.lib.utils.api_paths import (EPISODES_PARTIAL_PATHS, ART_PARTIAL_PATHS, build_paths,
@@ -247,34 +249,44 @@ class NFSessionOperations(SessionPathRequests):
         try:
             infos = get_info(videoid, None, None, profile_language_code)[0]
             art = get_art(videoid, None, profile_language_code)
+            if infos.get('Cast') and (videoid.mediatype == common.VideoId.EPISODE or infos.get('Trailer')):
+                return infos, art
+            LOG.debug('Cached video info for {} is missing cast/trailer; refreshing metadata', videoid)
         except (AttributeError, TypeError):
-            if videoid.mediatype == common.VideoId.EPISODE:
-                paths = (build_paths(['videos', int(videoid.value)], EPISODES_PARTIAL_PATHS) +
-                         build_paths(['videos', int(videoid.tvshowid)], ART_PARTIAL_PATHS + [[['title', 'delivery']]]))
-            else:
-                paths = build_paths(['videos', int(videoid.value)], VIDEO_LIST_PARTIAL_PATHS)
-            try:
-                raw_data = self.path_request(paths)
-            except req_exceptions.HTTPError as exc:
-                LOG.warn('Video info pathEvaluator lookup failed: {}. Falling back to metadata endpoint.', exc)
-                raw_data = self._get_videoid_info_metadata(videoid)
+            pass
+        if videoid.mediatype == common.VideoId.EPISODE:
+            paths = (build_paths(['videos', int(videoid.value)], EPISODES_PARTIAL_PATHS) +
+                     build_paths(['videos', int(videoid.tvshowid)], ART_PARTIAL_PATHS + [[['title', 'delivery']]]))
+        else:
+            paths = build_paths(['videos', int(videoid.value)], VIDEO_LIST_PARTIAL_PATHS)
+        try:
+            raw_data = self.path_request(paths)
+        except req_exceptions.HTTPError as exc:
+            LOG.warn('Video info pathEvaluator lookup failed: {}. Falling back to metadata endpoint.', exc)
+            raw_data = self._get_videoid_info_metadata(videoid)
+        infos = get_info(videoid, raw_data['videos'][videoid.value], raw_data, profile_language_code)[0]
+        if videoid.mediatype != common.VideoId.EPISODE and not infos.get('Trailer'):
+            LOG.debug('Video info for {} is missing trailer; refreshing from metadata endpoint', videoid)
+            raw_data = self._get_videoid_info_metadata(videoid)
             infos = get_info(videoid, raw_data['videos'][videoid.value], raw_data, profile_language_code)[0]
-            art = get_art(videoid, raw_data['videos'][videoid.value], profile_language_code)
+        art = get_art(videoid, raw_data['videos'][videoid.value], profile_language_code)
         return infos, art
 
     def _get_videoid_info_metadata(self, videoid):
         metadata_data = self.get_safe(
             endpoint='metadata',
             params={'movieid': videoid.value, '_': int(time.time() * 1000)})
-        video = metadata_data['video']
+        video = metadata_with_title_page_fallback(videoid.value, metadata_data['video'])
         item = self._metadata_video_to_path_item(videoid, video)
         videos = {videoid.value: item}
+        raw_data = {'videos': videos}
+        normalize_metadata_references(raw_data, videoid.value, video, item)
         if videoid.mediatype == common.VideoId.EPISODE and videoid.tvshowid:
             videos.setdefault(videoid.tvshowid, {
                 'title': {'value': video.get('seriesTitle') or video.get('showTitle') or ''},
                 'delivery': {'value': {}}
             })
-        return {'videos': videos}
+        return raw_data
 
     @staticmethod
     def _metadata_video_to_path_item(videoid, video):

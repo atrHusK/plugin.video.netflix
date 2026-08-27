@@ -16,7 +16,10 @@ from resources.lib.utils.api_paths import ART_SIZE_FHD, ART_SIZE_POSTER
 from resources.lib.services.nfsession.directorybuilder.dir_builder_items \
     import (build_video_listing, build_subgenres_listing, build_season_listing, build_episode_listing,
             build_loco_listing, build_mainmenu_listing, build_profiles_listing, build_lolomo_category_listing)
-from resources.lib.services.nfsession.directorybuilder.dir_path_requests import DirectoryPathRequests
+from resources.lib.services.nfsession.directorybuilder.dir_path_requests import (DirectoryPathRequests,
+                                                                                 _has_reference_entries,
+                                                                                 metadata_with_title_page_fallback,
+                                                                                 normalize_metadata_references)
 from resources.lib.utils.logging import LOG, measure_exec_time_decorator
 
 
@@ -124,11 +127,15 @@ class DirectoryBuilder(DirectoryPathRequests):
         return build_video_listing(video_list, menu_data, sub_genre_id, pathitems, perpetual_range_start,
                                    self.req_mylist_items())
 
-    def _enrich_video_list_art(self, video_list):
+    def _enrich_video_list_art(self, video_list, include_refs=False):
         if not getattr(video_list, 'videos', None):
             return video_list
         for video in video_list.videos.values():
-            if not isinstance(video, dict) or not self._needs_metadata_boxart(video):
+            if not isinstance(video, dict):
+                continue
+            needs_art = self._needs_metadata_boxart(video)
+            needs_refs = include_refs and not _has_reference_entries(video, 'cast')
+            if not needs_art and not needs_refs:
                 continue
             try:
                 videoid = VideoId.from_videolist_item(video)
@@ -139,9 +146,13 @@ class DirectoryBuilder(DirectoryPathRequests):
             try:
                 metadata = self.nfsession._metadata(videoid)  # pylint: disable=protected-access
             except Exception as exc:  # pylint: disable=broad-except
-                LOG.debug('Metadata art enrichment skipped for {}: {}', videoid, exc)
+                LOG.debug('Metadata enrichment skipped for {}: {}', videoid, exc)
                 continue
-            self._apply_metadata_art(video, metadata)
+            if needs_art:
+                self._apply_metadata_art(video, metadata)
+            if needs_refs:
+                metadata = metadata_with_title_page_fallback(videoid.value, metadata)
+                normalize_metadata_references(video_list.data, videoid.value, metadata, video)
         video_list.artitem = next(iter(video_list.videos.values()), None)
         return video_list
 
@@ -149,7 +160,7 @@ class DirectoryBuilder(DirectoryPathRequests):
     def _needs_metadata_boxart(video):
         poster = common.get_path_safe(['boxarts', ART_SIZE_POSTER, 'jpg', 'value', 'url'], video)
         fallback = common.get_path_safe(['itemSummary', 'value', 'boxArt', 'url'], video)
-        return not poster or poster == fallback
+        return not poster and not fallback
 
     @staticmethod
     def _apply_metadata_art(video, metadata):
