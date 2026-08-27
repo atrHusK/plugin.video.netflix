@@ -211,6 +211,12 @@ def _repair_browser_boxart_wide_cache(art, parsed_art, item):
     fallback = common.get_path_safe(['itemSummary', 'value', 'boxArt', 'url'], item)
     updated = False
     if fallback:
+        portrait_poster = parsed_art.get('poster')
+        if portrait_poster and portrait_poster != fallback:
+            for key in ('poster', 'thumb'):
+                if parsed_art.get(key) == portrait_poster and art.get(key) != portrait_poster:
+                    art[key] = portrait_poster
+                    updated = True
         for key in ('fanart', 'thumb', 'landscape'):
             if art.get(key) == fallback and parsed_art.get(key) != fallback:
                 art[key] = parsed_art.get(key, '')

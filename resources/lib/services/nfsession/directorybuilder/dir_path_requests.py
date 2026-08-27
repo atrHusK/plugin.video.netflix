@@ -29,7 +29,8 @@ from resources.lib.common.exceptions import (InvalidVideoListTypeError, InvalidV
 from resources.lib.database.db_utils import TABLE_SESSION
 from resources.lib.utils.api_paths import (VIDEO_LIST_PARTIAL_PATHS, RANGE_PLACEHOLDER, VIDEO_LIST_BASIC_PARTIAL_PATHS,
                                            SEASONS_PARTIAL_PATHS, EPISODES_PARTIAL_PATHS, ART_PARTIAL_PATHS,
-                                           ART_SIZE_POSTER, TRAILER_PARTIAL_PATHS, PATH_REQUEST_SIZE_STD, build_paths,
+                                           ART_SIZE_FHD, ART_SIZE_POSTER, TRAILER_PARTIAL_PATHS,
+                                           PATH_REQUEST_SIZE_STD, build_paths,
                                            PATH_REQUEST_SIZE_MAX)
 from resources.lib.common import cache_utils
 from resources.lib.globals import G
@@ -438,7 +439,58 @@ def _merge_search_metadata_video(base_video, metadata_video):
         episode_count = sum(len(season.get('episodes') or []) for season in seasons)
         if episode_count:
             merged['episodeCount'] = _value(episode_count)
+    poster_url = _metadata_image_url(metadata_video, ('boxart', 'boxArt'), portrait=True)
+    if poster_url:
+        boxarts = dict(merged.get('boxarts') or {})
+        boxarts[ART_SIZE_POSTER] = {
+            'jpg': {'value': {'url': poster_url}}
+        }
+        merged['boxarts'] = boxarts
+    landscape_url = _metadata_image_url(
+        metadata_video, ('artwork', 'storyart', 'storyArt', 'stills'), portrait=False)
+    if landscape_url:
+        interesting_moments = dict(merged.get('interestingMoment') or {})
+        interesting_moments[ART_SIZE_FHD] = {
+            'jpg': {'value': {'url': landscape_url}}
+        }
+        merged['interestingMoment'] = interesting_moments
     return merged
+
+
+def _metadata_image_url(metadata, keys, portrait):
+    candidates = []
+
+    def _collect(value):
+        if isinstance(value, str):
+            if value.startswith('http'):
+                candidates.append((value, 0, 0))
+            return
+        if isinstance(value, list):
+            for item in value:
+                _collect(item)
+            return
+        if not isinstance(value, dict):
+            return
+        url = value.get('url')
+        if isinstance(url, str) and url.startswith('http'):
+            width = value.get('w') or value.get('width') or 0
+            height = value.get('h') or value.get('height') or 0
+            candidates.append((url, width, height))
+        else:
+            for nested_value in value.values():
+                _collect(nested_value)
+
+    for key in keys:
+        _collect(metadata.get(key))
+    if not candidates:
+        return ''
+
+    def _score(candidate):
+        _url, width, height = candidate
+        matches_orientation = height > width if portrait else width >= height
+        return int(matches_orientation), width * height
+
+    return max(candidates, key=_score)[0]
 
 
 def _search_graphql_node_to_item(node):
@@ -635,6 +687,13 @@ def _set_browser_boxart(video, item_summary):
     video['boxarts'].setdefault(ART_SIZE_POSTER, {'jpg': {'value': art_value}})
 
 
+def _browser_item_summary_score(item_summary):
+    synopses = item_summary.get('synopses') or {}
+    synopsis = (synopses.get('regularSynopsis') or synopses.get('shortSynopsis') or
+                synopses.get('narrative'))
+    return bool(synopsis), len(synopsis or ''), len(item_summary)
+
+
 def _normalize_browser_video_fields(path_response):
     _normalize_browser_list_lengths(path_response)
     item_summaries = {}
@@ -650,7 +709,10 @@ def _normalize_browser_video_fields(path_response):
             if isinstance(ref_value, dict) and 'value' in ref_value:
                 ref_value = ref_value['value']
             if isinstance(ref_value, list) and len(ref_value) >= 2 and ref_value[0] == 'videos':
-                item_summaries[str(ref_value[1])] = item_summary
+                video_id = str(ref_value[1])
+                current_summary = item_summaries.get(video_id, {})
+                if _browser_item_summary_score(item_summary) > _browser_item_summary_score(current_summary):
+                    item_summaries[video_id] = item_summary
     for video_id, video in path_response.get('videos', {}).items():
         if not isinstance(video, dict):
             continue
@@ -699,6 +761,26 @@ def _normalize_browser_video_fields(path_response):
         video.setdefault('maturity', _value(item_summary.get('maturity', {})))
         video.setdefault('trackIds', _value({}))
         video.setdefault('requestId', _value(item_summary.get('requestId', '')))
+
+
+def _browser_list_video_ids(path_response, list_id):
+    video_ids = []
+    list_data = path_response.get('lists', {}).get(str(list_id), {})
+    for key, item in list_data.items():
+        if not common.is_numeric(key) or not isinstance(item, dict):
+            continue
+        ref = item.get('reference', {})
+        ref_value = ref.get('value') if isinstance(ref, dict) else ref
+        if isinstance(ref_value, dict) and 'value' in ref_value:
+            ref_value = ref_value['value']
+        video_id = None
+        if isinstance(ref_value, list) and len(ref_value) >= 2 and ref_value[0] == 'videos':
+            video_id = ref_value[1]
+        if video_id is None:
+            video_id = item.get('itemSummary', {}).get('value', {}).get('videoId')
+        if video_id is not None and str(video_id) not in video_ids:
+            video_ids.append(str(video_id))
+    return video_ids
 
 if TYPE_CHECKING:  # This variable/imports are used only by the editor, so not at runtime
     from resources.lib.services.nfsession.nfsession_ops import NFSessionOperations
@@ -1212,16 +1294,39 @@ class DirectoryPathRequests:
             video['queue'].setdefault('value', {})['inQueue'] = True
         return video_list
 
+    def _enrich_browser_video_list_metadata(self, path_response, list_id):
+        videos = path_response.get('videos', {})
+        for video_id in _browser_list_video_ids(path_response, list_id):
+            video_key = next((key for key in videos if str(key) == video_id), None)
+            if video_key is None:
+                continue
+            video = videos.get(video_key)
+            if not isinstance(video, dict):
+                continue
+            fallback_art = common.get_path_safe(
+                ['itemSummary', 'value', 'boxArt', 'url'], video)
+            poster_art = common.get_path_safe(
+                ['boxarts', ART_SIZE_POSTER, 'jpg', 'value', 'url'], video)
+            synopsis = (video.get('synopsis', {}).get('value') or
+                        video.get('regularSynopsis', {}).get('value'))
+            if synopsis and poster_art and poster_art != fallback_art:
+                continue
+            try:
+                metadata_video = self.nfsession._metadata(  # pylint: disable=protected-access
+                    video_id=common.VideoId(videoid=video_id))
+            except (MetadataNotAvailable, KeyError, TypeError, req_exceptions.RequestException):
+                LOG.warn('LoLoMo metadata enrichment skipped for video {}', video_id)
+                continue
+            videos[video_key] = _merge_search_metadata_video(video, metadata_video)
+
     def _browser_lolomo_video_list_by_id(self, category_name, list_id):
         self._browse_html_and_auth_url()
-        path_response = self._post_browser_path_evaluator_with_fallback(
-            self._browser_loco_paths(['lolomoByCategory', category_name], include_full_rows=True,
-                                     include_metadata=True),
+        path_response = self._post_browser_path_evaluator(
             self._browser_loco_paths(['lolomoByCategory', category_name], include_full_rows=True),
-            'https://www.netflix.com/latest',
-            f'LoLoMo category {category_name}')
+            'https://www.netflix.com/latest')
         if str(list_id) not in path_response.get('lists', {}):
             raise InvalidVideoListTypeError(f'No LoLoMo category list with id {list_id}')
+        self._enrich_browser_video_list_metadata(path_response, str(list_id))
         return VideoList(path_response, str(list_id))
 
     def _browser_genre_video_list_by_id(self, genre_id, list_id):
