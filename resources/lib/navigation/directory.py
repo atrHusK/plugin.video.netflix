@@ -17,6 +17,7 @@ from resources.lib.database.db_utils import TABLE_MENU_DATA
 from resources.lib.globals import G
 from resources.lib.navigation.directory_utils import (finalize_directory, custom_viewmode,
                                                       end_of_directory, get_title, activate_profile, auto_scroll)
+from resources.lib.common.exceptions import InvalidVideoListTypeError
 from resources.lib.utils.logging import LOG, measure_exec_time_decorator
 
 
@@ -185,7 +186,15 @@ class Directory:
             'perpetual_range_start': self.perpetual_range_start,
             'is_dynamic_id': len(pathitems) > 2 and not G.is_known_menu_context(pathitems[2])
         }
-        dir_items, extra_data = common.make_call('get_video_list_sorted', call_args)
+        # My List is read in pages, it needs more time than an ordinary list
+        timeout = (common.IPC_TIMEOUT_SECS_PAGE_PARSE if menu_data['path'][1] == 'myList'
+                   else common.IPC_TIMEOUT_SECS)
+        try:
+            dir_items, extra_data = common.make_call('get_video_list_sorted', call_args, timeout=timeout)
+        except InvalidVideoListTypeError as exc:
+            # Netflix no longer provides the contents of this list, show it as empty
+            LOG.warn('The list is not available ({})', exc)
+            dir_items, extra_data = [], {}
         sort_type = 'sort_nothing'
         if menu_data['path'][1] == 'myList' and int(G.ADDON.getSettingInt('menu_sortorder_mylist')) == 0:
             # At the moment it is not possible to make a query with results sorted for the 'mylist',
@@ -194,6 +203,42 @@ class Directory:
 
         finalize_directory(dir_items, menu_data.get('content_type', G.CONTENT_SHOW),
                            title=get_title(menu_data, extra_data), sort_type=sort_type)
+        end_of_directory(self.dir_update_listing)
+        return menu_data.get('view')
+
+    @measure_exec_time_decorator()
+    @custom_viewmode(G.VIEW_FOLDER)
+    def home_rows(self, pathitems):
+        """Show the rows of the Netflix home page as folders"""
+        menu_data = G.MAIN_MENU_ITEMS.get(pathitems[1])
+        try:
+            dir_items, extra_data = common.make_call('get_home_rows', {'menu_data': menu_data},
+                                                     timeout=common.IPC_TIMEOUT_SECS_PAGE_PARSE)
+        except InvalidVideoListTypeError as exc:
+            LOG.warn('The Netflix home rows are not available ({})', exc)
+            dir_items, extra_data = [], {}
+        finalize_directory(dir_items, G.CONTENT_FOLDER,
+                           title=get_title(menu_data, extra_data), sort_type='sort_nothing')
+        end_of_directory(self.dir_update_listing)
+        return menu_data.get('view')
+
+    @measure_exec_time_decorator()
+    @custom_viewmode(G.VIEW_SHOW)
+    def home_row(self, pathitems):
+        """Show the videos of a single row of the Netflix home page"""
+        menu_data = G.LOCAL_DB.get_value(pathitems[2], table=TABLE_MENU_DATA, data_type=dict)
+        if not menu_data:
+            menu_data = G.MAIN_MENU_ITEMS.get(pathitems[1])
+        try:
+            dir_items, extra_data = common.make_call('get_home_row_videos',
+                                                     {'row_index': pathitems[2],
+                                                      'menu_data': menu_data},
+                                                     timeout=common.IPC_TIMEOUT_SECS_PAGE_PARSE)
+        except InvalidVideoListTypeError as exc:
+            LOG.warn('The Netflix home row is not available ({})', exc)
+            dir_items, extra_data = [], {}
+        finalize_directory(dir_items, menu_data.get('content_type', G.CONTENT_SHOW),
+                           title=get_title(menu_data, extra_data), sort_type='sort_nothing')
         end_of_directory(self.dir_update_listing)
         return menu_data.get('view')
 
@@ -228,6 +273,22 @@ class Directory:
                            title=get_title(menu_data, extra_data), sort_type='sort_label')
         end_of_directory(False)
         return menu_data.get('view')
+
+    @measure_exec_time_decorator()
+    @custom_viewmode(G.VIEW_SHOW)
+    def similar(self, pathitems):  # pylint: disable=unused-argument
+        """Show the titles the website suggests next to a tv show / movie"""
+        menu_data = {'path': ['is_context_menu_item', 'is_context_menu_item'],
+                     'title': common.get_local_string(30415)}
+        from json import loads
+        call_args = {
+            'menu_data': menu_data,
+            'video_id_dict': loads(self.params['video_id_dict'])
+        }
+        dir_items, extra_data = common.make_call('get_similar_video_list', call_args)
+        finalize_directory(dir_items, G.CONTENT_SHOW, 'sort_nothing',
+                           title=get_title(menu_data, extra_data))
+        end_of_directory(False)
 
     @measure_exec_time_decorator()
     @custom_viewmode(G.VIEW_SHOW)
@@ -287,6 +348,36 @@ class Directory:
 
         finalize_directory(dir_items, G.CONTENT_FOLDER,
                            title=get_title(menu_data, extra_data), sort_type='sort_label')
+        end_of_directory(False)
+        return menu_data.get('view')
+
+    @custom_viewmode(G.VIEW_FOLDER)
+    def audio_description(self, pathitems):
+        """Show the collections of a search, or the videos of one of them"""
+        menu_data = G.MAIN_MENU_ITEMS[pathitems[1]]
+        search_term = menu_data['search_term']
+        if len(pathitems) < 3:
+            dir_items, extra_data = common.make_call('get_collections',
+                                                     {'menu_data': menu_data,
+                                                      'search_term': search_term})
+            finalize_directory(dir_items, G.CONTENT_FOLDER,
+                               title=get_title(menu_data, extra_data), sort_type='sort_label')
+            end_of_directory(False)
+            return menu_data.get('view')
+        collection_key = pathitems[2]
+        sub_menu_data = G.LOCAL_DB.get_value(collection_key, table=TABLE_MENU_DATA,
+                                             data_type=dict) or menu_data
+        collection_id = sub_menu_data.get('collection_id') or collection_key.replace('_', ':', 1)
+        call_args = {
+            'menu_data': sub_menu_data,
+            'collection_id': collection_id,
+            'collection_name': sub_menu_data.get('collection_name', collection_id),
+            'search_term': search_term,
+            'pathitems': pathitems
+        }
+        dir_items, extra_data = common.make_call('get_collection_video_list', call_args)
+        finalize_directory(dir_items, menu_data.get('content_type', G.CONTENT_SHOW),
+                           title=get_title(sub_menu_data, extra_data), sort_type='sort_label')
         end_of_directory(False)
         return menu_data.get('view')
 

@@ -20,6 +20,8 @@ from .misc_utils import run_threaded
 IPC_TIMEOUT_SECS = 20
 # The login can wait the user that gets the one-time code sent by Netflix
 IPC_TIMEOUT_SECS_LOGIN = 600
+# Reading the Netflix home page rows needs to download and parse the whole browse page
+IPC_TIMEOUT_SECS_PAGE_PARSE = 60
 
 # IPC over HTTP endpoints
 IPC_ENDPOINT_CACHE = '/netflix_service/cache'

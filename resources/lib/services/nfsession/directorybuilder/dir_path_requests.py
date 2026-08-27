@@ -12,6 +12,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 from types import SimpleNamespace
+import base64
 import json
 import re
 import time
@@ -27,7 +28,7 @@ from resources.lib.utils.data_types import (VideoListSorted, SubgenreList, Seaso
                                             CustomVideoList, LoLoMoCategory, VideoListSupplemental,
                                             VideosList)
 from resources.lib.common.exceptions import (InvalidVideoListTypeError, InvalidVideoId, MetadataNotAvailable,
-                                             WebsiteParsingError)
+                                             WebsiteParsingError, APIError)
 from resources.lib.database.db_utils import TABLE_SESSION
 from resources.lib.utils.api_paths import (VIDEO_LIST_PARTIAL_PATHS, RANGE_PLACEHOLDER, VIDEO_LIST_BASIC_PARTIAL_PATHS,
                                            SEASONS_PARTIAL_PATHS, EPISODES_PARTIAL_PATHS, ART_PARTIAL_PATHS,
@@ -40,11 +41,18 @@ from resources.lib.utils.logging import LOG
 
 GRAPHQL_URL = 'https://web.prod.cloud.netflix.com/graphql'
 GRAPHQL_OP_SEASONS = 'dbc3b274-d4f9-4811-aaf1-d082d3b936f2'
-GRAPHQL_OP_EPISODES = '27b30e4e-871d-46aa-ac8b-244103d2e37d'
-GRAPHQL_OP_SEARCH = '8d902979-56f2-4886-8c16-f8910f6b52ee'
-GRAPHQL_OP_CAROUSEL_PAGE = 'cbe70fd8-c3a1-4e1b-9ab3-d690850ad7f3'
-GRAPHQL_OP_DETAIL_MODAL = '7265187b-c065-4714-9eee-327751c8e215'
+GRAPHQL_OP_EPISODES = '4cf0a279-dd32-454d-9758-486359c0d48b'
+GRAPHQL_OP_SEARCH = '85718832-510c-4c98-b516-6e0df6df2c9c'
+GRAPHQL_OP_SEARCH_ENTITY = '3a9321da-cc3e-41d4-bdc1-66857afe09e6'
+# The website reaches the audio description collections through this search,
+# the ids come back with them so they are never hardcoded
+AUDIO_DESCRIPTION_SEARCH_TERM = 'audio'
+GRAPHQL_OP_CAROUSEL_PAGE = '38fb041b-57ae-4aaa-a3d0-0df55be0f76c'
+GRAPHQL_OP_FETCH_MORE_SECTIONS = '8f69cf19-8c5c-498f-98a1-abb8a5d7ad5d'
+GRAPHQL_OP_PROFILES_SUMMARY = '2d907549-08ae-495b-a2c8-6777d38e9e0f'
+GRAPHQL_OP_DETAIL_MODAL = '7daad060-5725-4a2b-9d72-ffcfdc1b8760'
 GRAPHQL_OP_DETAIL_MODAL_TRAILERS = '06e30ee5-7983-4fef-8135-5914124b76ad'
+GRAPHQL_OP_DETAIL_MODAL_SIMILARS = '838718e1-85d7-41e6-b637-6a74dfda11d1'
 TOP_PICKS_SECTION_LABEL = 'top picks'
 NETFLIX_TITLE_URL = 'https://www.netflix.com/title/{}'
 TITLE_PAGE_GRAPHQL_RE = re.compile(r"netflix\.reactContext\.models\.graphql\s*=\s*JSON\.parse\('(.*?)'\);", re.DOTALL)
@@ -53,7 +61,12 @@ TITLE_PAGE_JSONLD_RE = re.compile(
 LOCO_ROOT_ID_RE = re.compile(r'NES_[A-Za-z0-9_]+_p_\d+')
 LOCO_ROOT_CANDIDATE_RE = re.compile(r'NES_[A-Za-z0-9_]+')
 LOCO_ROW_RANGE = {'from': 0, 'to': 50}
+# The home page has no LoCo root anymore, do not pay for the lookup at every home open
+LOCO_ROOT_RETRY_INTERVAL_SECS = 1800
 LOCO_PAGE_RANGE = {'from': 0, 'to': 20}
+# The browse page is asked again right after a request falls back to it, do not
+# pay twice for the same page inside one listing
+BROWSE_PAGE_CACHE_SECS = 30
 LOCO_REFERENCE_FIELDS = [
     'availability', 'episodeCount', 'inRemindMeList', 'queue', 'summary',
     'title', 'synopsis', 'runtime', 'seasonCount', 'bookmarkPosition',
@@ -89,6 +102,8 @@ BROWSER_LOCO_HOME_ROW_RANGE = {'from': 4, 'to': 50}
 BROWSER_LOCO_HOME_VISIBLE_RANGE = {'from': 0, 'to': 8}
 BROWSER_LOCO_CONTINUE_LAZY_RANGE = {'from': 8, 'to': 100}
 BROWSER_MYLIST_RANGE = {'from': 0, 'to': 48}
+BROWSER_MYLIST_PAGE_SIZE = 48
+BROWSER_MYLIST_MAX_PAGES = 12
 BROWSER_MYLIST_FIELDS = [
     'availability', 'episodeCount', 'inRemindMeList', 'itemSummary',
     'queue', 'summary'
@@ -422,18 +437,20 @@ def _episode_node_to_item(node, season_number, metadata=None):
     }
 
 
-def _search_graphql_artwork_params():
+def _search_graphql_artwork_params(high_res=False):
+    dimension = {'width': 665, 'height': 375} if high_res else {'width': 342, 'height': 192}
     return {
-        'artworkType': 'BOXSHOT',
-        'dimension': {'width': 300, 'height': 420},
-        'features': {'fallbackStrategy': 'STILL'}
+        'artworkType': 'SDP',
+        'dimension': dimension,
+        'features': {'enableLockBadgeChecks': True, 'fallbackStrategy': 'STILL'}
     }
 
 
-def _search_graphql_game_artwork_params(artwork_type, top_content_type_badge):
+def _search_graphql_game_artwork_params(artwork_type, top_content_type_badge, high_res=False):
+    dimension = {'width': 665, 'height': 375} if high_res else {'width': 342, 'height': 192}
     return {
         'artworkType': artwork_type,
-        'dimension': {'width': 342, 'height': 192},
+        'dimension': dimension,
         'features': {'fallbackStrategy': 'STILL', 'topContentTypeBadge': top_content_type_badge}
     }
 
@@ -483,12 +500,62 @@ def _search_graphql_variables(search_term, end_cursor=None):
             'GAME_CLOUD_BOXART_HORIZONTAL_INCOMPATIBLE', True),
         'imageParamsForMobileGameBoxart': _search_graphql_game_artwork_params(
             'GAME_ICON_BOXART_HORIZONTAL_CARD', True),
+        'imageParamsForStandardBoxartHighRes': _search_graphql_artwork_params(high_res=True),
+        'imageParamsForCloudGameBoxartHighRes': _search_graphql_game_artwork_params(
+            'GAME_CLOUD_BOXART_HORIZONTAL_INCOMPATIBLE', True, high_res=True),
+        'fetchHighResCards': False,
         'pageSize': SEARCH_GRAPHQL_PAGE_SIZE,
         'options': _search_graphql_options(),
         'searchTerm': search_term,
-        'selectedSuggestionId': None,
         'endCursor': end_cursor
     }
+
+
+def _similar_node_to_item(node):
+    """Turn a video of the suggestions of the website into an item of a list"""
+    video_id = str(node.get('videoId') or '')
+    if not video_id:
+        return None
+    video_type = 'show' if node.get('__typename') == 'Show' else 'movie'
+    title = node.get('title') or video_id
+    synopsis = (node.get('contextualSynopsis') or {}).get('text') or ''
+    item = {
+        'summary': _summary(video_id, title, video_type),
+        'title': _value(title),
+        'synopsis': _value(synopsis),
+        'regularSynopsis': _value(synopsis),
+        'availability': _value({'isPlayable': bool(node.get('isPlayable', True))}),
+        'queue': _value({'inQueue': False}),
+        'inRemindMeList': _value(False),
+        'bookmarkPosition': _value((node.get('bookmark') or {}).get('position', 0) or 0),
+        'creditsOffset': _value(0),
+        'watchedToEndOffset': _value(0),
+        'watched': _value(False),
+        'runtime': _value(node.get('runtimeSec', 0) or 0),
+        'releaseYear': _value(node.get('latestYear', 0) or 0),
+        'maturity': _value(node.get('contentAdvisory') or {}),
+        'trackIds': _value({}),
+        'requestId': _value('')
+    }
+    boxart = node.get('boxart') or {}
+    if boxart.get('url'):
+        _set_browser_boxart(item, {
+            'id': int(video_id),
+            'title': title,
+            'boxArt': {'url': boxart['url'],
+                       'width': boxart.get('width'),
+                       'height': boxart.get('height')}
+        })
+    return video_id, item
+
+
+def _search_entity_graphql_variables(entity_id, display_string, query_string, end_cursor=None):
+    variables = _search_graphql_variables(query_string, end_cursor)
+    del variables['searchTerm']
+    variables['entityId'] = entity_id
+    variables['entityDisplayString'] = display_string
+    variables['queryString'] = query_string
+    return variables
 
 
 def _merge_search_metadata_video(base_video, metadata_video):
@@ -646,7 +713,7 @@ def _carousel_graphql_variables(row_id, end_cursor):
         'imageParamsForStandardBoxart': {
             'artworkType': 'SDP',
             'dimension': {'width': 342, 'height': 192},
-            'features': {'fallbackStrategy': 'STILL'}
+            'features': {'fallbackStrategy': 'STILL', 'enableLockBadgeChecks': True}
         },
         'imageParamsForRankedBoxart': {
             'artworkType': 'BOXSHOT',
@@ -673,6 +740,32 @@ def _carousel_graphql_variables(row_id, end_cursor):
             'dimension': {'width': 200, 'height': 200},
             'formats': ['WEBP', 'JPG', 'PNG']
         },
+        'fetchHighResCards': False,
+        'imageParamsForStandardBoxartHighRes': {
+            'artworkType': 'SDP',
+            'dimension': {'width': 665, 'height': 375},
+            'features': {'fallbackStrategy': 'STILL', 'enableLockBadgeChecks': True}
+        },
+        'imageParamsForContinueWatchingBoxartHighRes': {
+            'artworkType': 'SDP',
+            'dimension': {'width': 665, 'height': 375},
+            'features': {'fallbackStrategy': 'STILL'}
+        },
+        'imageParamsForCloudGameBoxartHighRes': {
+            'artworkType': 'SDP',
+            'dimension': {'width': 665, 'height': 375},
+            'features': {'fallbackStrategy': 'STILL'}
+        },
+        'imageParamsForEntryPointBackground': {
+            'artworkType': 'MLP_ENTRY_POINT_BACKGROUND',
+            'dimension': {'width': 1024},
+            'features': {'fallbackStrategy': 'STILL'}
+        },
+        'imageParamsForEntryPointLogo': {
+            'artworkType': 'LOGO_STACKED_CROPPED',
+            'dimension': {'height': 260},
+            'formats': ['WEBP', 'JPG', 'PNG']
+        },
         'carouselVersion': '1'
     }
 
@@ -691,6 +784,329 @@ def _graphql_cache_node(graphql_data, typename, video_id):
         if key.startswith(key_prefix) and str(candidate.get('videoId')) == video_id:
             return candidate
     return None
+
+
+def _log_carousel_sections(graphql_data):
+    """Log the sections of the page and the kind of their entities"""
+    for key, section in graphql_data.items():
+        if not isinstance(section, dict) or section.get('__typename') != 'PinotCarouselSection':
+            continue
+        connection = _graphql_ref_node(graphql_data, section.get('entities'))
+        types = []
+        for edge in _iter_graphql_edges(connection if isinstance(connection, dict) else {}):
+            edge_data = _graphql_ref_node(graphql_data, edge)
+            node = _graphql_ref_node(graphql_data, (edge_data or {}).get('node'))
+            if isinstance(node, dict):
+                types.append(node.get('__typename'))
+        entities = section.get('entities') if isinstance(section.get('entities'), dict) else {}
+        page_info = entities.get('pageInfo') or {}
+        LOG.debug('SECTION diagnostics: [{}] totalCount={} edges={} types={} hasNextPage={} endCursor={}',
+                  section.get('displayString'), entities.get('totalCount'), len(types),
+                  sorted(set(types)), page_info.get('hasNextPage'), page_info.get('endCursor'))
+
+
+FETCH_MORE_SECTIONS_PAGE_SIZE = 8
+FETCH_MORE_SECTIONS_MAX_PAGES = 12
+
+
+def _fetch_more_sections_variables(page_id, after_cursor):
+    variables = {
+        'pageId': page_id,
+        'sectionsAfterCursor': after_cursor,
+        'sectionCount': FETCH_MORE_SECTIONS_PAGE_SIZE
+    }
+    variables.update(
+    {
+        "carouselPageSize": 13,
+        "eddEnabled": False,
+        "fetchHighResCards": False,
+        "imageParamsForAppIcon": {
+            "artworkType": "APP_ICON",
+            "dimension": {
+                "height": 200,
+                "width": 200
+            },
+            "formats": [
+                "WEBP",
+                "JPG",
+                "PNG"
+            ]
+        },
+        "imageParamsForBillboardLogo": {
+            "artworkType": "LOGO_STACKED_CROPPED",
+            "dimension": {
+                "height": 260,
+                "width": 650
+            },
+            "formats": [
+                "WEBP",
+                "JPG",
+                "PNG"
+            ]
+        },
+        "imageParamsForBrandLogo": {
+            "artworkType": "BRAND_LOGO_SMALL_FLEX",
+            "dimension": {
+                "height": 30
+            },
+            "features": {
+                "graybox": False,
+                "tone": "LIGHT"
+            },
+            "formats": [
+                "WEBP",
+                "JPG",
+                "PNG"
+            ]
+        },
+        "imageParamsForCharacterCircle": {
+            "artworkType": "SQUAREHEADSHOT_1000x1000",
+            "dimension": {
+                "height": 200,
+                "width": 200
+            },
+            "formats": [
+                "WEBP",
+                "JPG",
+                "PNG"
+            ]
+        },
+        "imageParamsForCloudGameBoxart": {
+            "artworkType": "SDP",
+            "dimension": {
+                "height": 192,
+                "width": 342
+            },
+            "features": {
+                "fallbackStrategy": "STILL"
+            }
+        },
+        "imageParamsForCloudGameBoxartHighRes": {
+            "artworkType": "SDP",
+            "dimension": {
+                "height": 375,
+                "width": 665
+            },
+            "features": {
+                "fallbackStrategy": "STILL"
+            }
+        },
+        "imageParamsForContinueWatchingBoxart": {
+            "artworkType": "SDP",
+            "dimension": {
+                "height": 192,
+                "width": 342
+            },
+            "features": {
+                "fallbackStrategy": "STILL"
+            }
+        },
+        "imageParamsForContinueWatchingBoxartHighRes": {
+            "artworkType": "SDP",
+            "dimension": {
+                "height": 375,
+                "width": 665
+            },
+            "features": {
+                "fallbackStrategy": "STILL"
+            }
+        },
+        "imageParamsForEntryPointBackground": {
+            "artworkType": "MLP_ENTRY_POINT_BACKGROUND",
+            "dimension": {
+                "width": 1024
+            },
+            "features": {
+                "fallbackStrategy": "STILL"
+            }
+        },
+        "imageParamsForEntryPointLogo": {
+            "artworkType": "LOGO_STACKED_CROPPED",
+            "dimension": {
+                "height": 260
+            },
+            "formats": [
+                "WEBP",
+                "JPG",
+                "PNG"
+            ]
+        },
+        "imageParamsForHorizontalBillboardBackground": {
+            "artworkType": "ECLIPSE_BILLBOARD",
+            "dimension": {
+                "height": 1080,
+                "width": 1920
+            },
+            "formats": [
+                "WEBP",
+                "JPG",
+                "PNG"
+            ]
+        },
+        "imageParamsForMobileGameBoxart": {
+            "artworkType": "APP_ICON",
+            "dimension": {
+                "height": 200,
+                "width": 200
+            },
+            "formats": [
+                "WEBP",
+                "JPG",
+                "PNG"
+            ]
+        },
+        "imageParamsForPodcastEpisodicLogo": {
+            "artworkType": "LOGO_HORIZONTAL_CROPPED",
+            "dimension": {
+                "height": 216,
+                "scaleStrategy": "CONTAIN",
+                "width": 960
+            },
+            "features": {
+                "tone": "LIGHT"
+            }
+        },
+        "imageParamsForPodcastEpisodicStill": {
+            "artworkType": "SEGMENT_STILL",
+            "dimension": {
+                "height": 192,
+                "scaleStrategy": "COVER",
+                "width": 342
+            },
+            "features": {
+                "graybox": False
+            }
+        },
+        "imageParamsForPodcastEpisodicStillHighRes": {
+            "artworkType": "SEGMENT_STILL",
+            "dimension": {
+                "height": 375,
+                "scaleStrategy": "COVER",
+                "width": 665
+            },
+            "features": {
+                "graybox": False
+            }
+        },
+        "imageParamsForRankedBoxart": {
+            "artworkType": "BOXSHOT",
+            "dimension": {
+                "height": 607,
+                "width": 426
+            },
+            "features": {
+                "fallbackStrategy": "STILL",
+                "suppressTop10Badge": True
+            }
+        },
+        "imageParamsForStandardBoxart": {
+            "artworkType": "SDP",
+            "dimension": {
+                "height": 192,
+                "width": 342
+            },
+            "features": {
+                "enableLockBadgeChecks": True,
+                "fallbackStrategy": "STILL"
+            }
+        },
+        "imageParamsForStandardBoxartHighRes": {
+            "artworkType": "SDP",
+            "dimension": {
+                "height": 375,
+                "width": 665
+            },
+            "features": {
+                "enableLockBadgeChecks": True,
+                "fallbackStrategy": "STILL"
+            }
+        },
+        "imageParamsForVerticalBackgroundFallback": {
+            "artworkType": "ECLIPSE_BOXART_BACKGROUND",
+            "dimension": {
+                "width": 500
+            },
+            "formats": [
+                "WEBP",
+                "JPG",
+                "PNG"
+            ]
+        },
+        "imageParamsForVerticalBillboardBackground": {
+            "artworkType": "VERTICAL_BILLBOARD_PLUS",
+            "dimension": {
+                "height": 1000,
+                "width": 640
+            },
+            "formats": [
+                "WEBP",
+                "JPG",
+                "PNG"
+            ]
+        }
+    }
+    )
+    return variables
+
+
+def _home_section_key(section_id):
+    """Return the stable part of a section id, the rest changes at every page load"""
+    token = str(section_id or '')
+    try:
+        padded = token + '=' * (-len(token) % 4)
+        decoded = json.loads(base64.b64decode(padded).decode('utf-8'))
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return token
+    return str(decoded.get('sectionId') or token) if isinstance(decoded, dict) else token
+
+
+def _home_carousel_sections(graphql_data):
+    """Return the home page rows in page order as (section_id, section, connection) tuples"""
+    sections = []
+    for key, section in graphql_data.items():
+        if not isinstance(section, dict) or section.get('__typename') != 'PinotCarouselSection':
+            continue
+        if not str(section.get('displayString') or '').strip():
+            continue
+        connection = _graphql_ref_node(graphql_data, section.get('entities'))
+        if not isinstance(connection, dict):
+            continue
+        if not any(True for _edge in _iter_graphql_edges(connection)):
+            continue
+        sections.append((str(section.get('_id') or section.get('id') or key), section, connection))
+    return sections
+
+
+def _home_sections_page_info(graphql_data):
+    """Return (page id, cursor, has next page) of the home page sections connection"""
+    for value in graphql_data.values():
+        if not isinstance(value, dict):
+            continue
+        page_id = value.get('id')
+        if not page_id or not str(page_id).startswith('PS_'):
+            continue
+        for key, field in value.items():
+            if key != 'sections' and not key.startswith('sections('):
+                continue
+            connection = _graphql_ref_node(graphql_data, field)
+            if not isinstance(connection, dict):
+                continue
+            page_info = _graphql_ref_node(graphql_data, connection.get('pageInfo')) or {}
+            if page_info.get('endCursor'):
+                return str(page_id), page_info['endCursor'], bool(page_info.get('hasNextPage'))
+    return None, None, False
+
+
+def _empty_loco_response():
+    return {'locos': {'root': {'componentSummary': _value({'length': 0})}}, 'lists': {}}
+
+
+def _ensure_loco_response(path_response, description):
+    """Netflix no longer returns some lists, provide an empty structure to not break the caller"""
+    if isinstance(path_response, dict) and 'locos' in path_response:
+        return path_response
+    LOG.warn('No rows returned for {}, using an empty list', description)
+    return {'locos': {'root': {'componentSummary': _value({'length': 0})}}, 'lists': {}}
 
 
 def _graphql_ref_node(graphql_data, node_or_ref):
@@ -802,6 +1218,9 @@ def _title_page_graphql_data(content, react_context):
     html = content.decode('utf-8', 'replace') if isinstance(content, bytes) else str(content)
     match = TITLE_PAGE_GRAPHQL_RE.search(html)
     if not match:
+        LOG.debug('PAGE diagnostics: no graphql cache, len {} markers {}', len(html),
+                  {k: html.count(k) for k in ('Pinot', 'PinotCarouselSection', 'models.graphql',
+                                              'reactContext', 'falcorCache', 'JSON.parse')})
         return {}
     try:
         graphql_cache = json.loads(website.decode_javascript_string(match.group(1)))
@@ -809,6 +1228,13 @@ def _title_page_graphql_data(content, react_context):
         LOG.warn('Unable to parse title page GraphQL cache ({})', type(exc).__name__)
         return {}
     graphql_data = graphql_cache.get('data') if isinstance(graphql_cache, dict) else None
+    if isinstance(graphql_data, dict):
+        types = {}
+        for key in graphql_data:
+            name = key.split(':')[0]
+            types[name] = types.get(name, 0) + 1
+        LOG.debug('PAGE diagnostics: graphql cache entries {} types {}', len(graphql_data),
+                  sorted(types.items(), key=lambda item: -item[1])[:8])
     return graphql_data if isinstance(graphql_data, dict) else {}
 
 
@@ -822,6 +1248,50 @@ def _normalize_browser_list_lengths(path_response):
         for key in list(list_data.keys()):
             if common.is_numeric(key) and int(key) >= length:
                 del list_data[key]
+
+
+def _browser_sorted_list_paths(base_path):
+    """The paths the website asks for a sorted list of a genre
+
+    The previous request asks a set of fields that the server now refuses with a 404,
+    the website asks the item summary and a short list of reference fields instead.
+    """
+    range_path = list(base_path) + [RANGE_PLACEHOLDER]
+    return [
+        range_path + ['itemSummary'],
+        range_path + ['reference', BROWSER_LOCO_REFERENCE_FIELDS],
+        list(base_path) + ['requestId'],
+        list(base_path[:-1]) + [['id', 'listId', 'requestId', 'trackIds']]
+    ]
+
+
+def _normalize_browser_sorted_fields(path_response, base_path):
+    """Move the item summaries of a sorted list onto the videos, the way the rows do"""
+    container = path_response
+    for key in base_path:
+        if not isinstance(container, dict):
+            return
+        container = container.get(str(key), {})
+    if not isinstance(container, dict):
+        return
+    videos = path_response.setdefault('videos', {})
+    for item in container.values():
+        if not isinstance(item, dict):
+            continue
+        item_summary = item.get('itemSummary', {})
+        item_summary = item_summary.get('value', {}) if isinstance(item_summary, dict) else {}
+        if not item_summary:
+            continue
+        ref = item.get('reference', {})
+        ref_value = ref.get('value') if isinstance(ref, dict) else ref
+        if isinstance(ref_value, dict) and 'value' in ref_value:
+            ref_value = ref_value['value']
+        if not (isinstance(ref_value, list) and len(ref_value) >= 2 and ref_value[0] == 'videos'):
+            continue
+        video = videos.setdefault(str(ref_value[1]), {})
+        if isinstance(video, dict):
+            video.setdefault('itemSummary', _value(item_summary))
+    _normalize_browser_video_fields(path_response)
 
 
 def _browser_reference_paths(reference_path, include_metadata=False):
@@ -939,6 +1409,16 @@ def _normalize_browser_video_fields(path_response):
         video.setdefault('requestId', _value(item_summary.get('requestId', '')))
 
 
+def _browser_mylist_is_full_page(mylist_data, page_from, page_to):
+    """True when the last requested page came back full, so another page may follow"""
+    for index in range(page_from, page_to + 1):
+        entry = mylist_data.get(str(index))
+        if isinstance(entry, dict) and entry.get('$type') == 'ref':
+            continue
+        return False
+    return True
+
+
 def _browser_list_video_ids(path_response, list_id):
     video_ids = []
     list_data = path_response.get('lists', {}).get(str(list_id), {})
@@ -967,8 +1447,21 @@ class DirectoryPathRequests:
 
     def __init__(self, nfsession: 'NFSessionOperations'):
         self.nfsession = nfsession
+        # The contexts whose sorted list the server refuses with the previous fields,
+        # once one is refused the next lists of the same context go straight to the
+        # fields the website asks instead of paying for a request that fails
+        self.refused_sorted_fields = set()
+        # True once the server refuses the reference fields of a LoLoMo list, the
+        # lists all live in the same LoLoMo so the next ones go straight to the
+        # browser-shaped request instead of paying for a request that fails and,
+        # worse, makes the session look expired
+        self.refused_video_list_fields = False
+        self._browse_page_cache = None
 
     @cache_utils.cache_output(cache_utils.CACHE_MYLIST, fixed_identifier='my_list_items', ignore_self_class=True)
+    # Same identifier the add and remove of my list keep updated, see _update_mylist_cache
+    @cache_utils.cache_output(cache_utils.CACHE_MYLIST, fixed_identifier='my_list_items',
+                              ignore_self_class=True)
     def req_mylist_items(self):
         """Return the 'my list' video list as videoid items"""
         LOG.debug('Requesting "my list" video list as videoid items')
@@ -993,6 +1486,23 @@ class DirectoryPathRequests:
         #      (when 'loco_known'==True and loco_contexts is set, see MAIN_MENU_ITEMS in globals.py)
         # - To get list items for menus that have multiple contexts set to 'loco_contexts' like 'recommendations' menu
         LOG.debug('Requesting LoCo root lists')
+        unavailable_since = getattr(self, '_loco_root_unavailable_since', 0)
+        if unavailable_since:
+            elapsed = time.monotonic() - unavailable_since
+            if elapsed < LOCO_ROOT_RETRY_INTERVAL_SECS:
+                LOG.debug('LOCO ROOT: unavailable {}s ago, using the built-in menu labels', int(elapsed))
+                return LoCo(_empty_loco_response())
+        # The website asks for the rows of a known root id, the bare 'loco' root is the previous one
+        try:
+            path_response = self._req_current_loco_root_data()
+            if path_response.get('lists'):
+                LOG.info('LOCO ROOT: the current root serves {} lists', len(path_response['lists']))
+                self._loco_root_unavailable_since = 0
+                return LoCo(path_response)
+            LOG.info('LOCO ROOT: the current root serves no lists, trying the previous root')
+        except (InvalidVideoListTypeError, req_exceptions.RequestException) as exc:
+            LOG.info('LOCO ROOT: current root lookup failed ({}), trying the previous root',
+                     type(exc).__name__)
         paths = ([['loco', 'componentSummary'],
                   ['loco', {'from': 0, 'to': 50}, 'componentSummary'],
                   # Titles of first 4 videos in each video list (needed only to show titles in the plot description)
@@ -1005,9 +1515,12 @@ class DirectoryPathRequests:
         except req_exceptions.HTTPError as exc:
             if exc.response is None or exc.response.status_code != 404:
                 raise
-            LOG.warn('Falling back to empty LoCo root menu after pathEvaluator 404')
-            path_response = {'locos': {'root': {'componentSummary': _value({'length': 0})}}, 'lists': {}}
-        return LoCo(path_response)
+            LOG.warn('The LoCo root is not available, the main menu will use the built-in labels')
+            self._loco_root_unavailable_since = time.monotonic()
+            return LoCo(_empty_loco_response())
+        path_response.setdefault('lists', {})
+        self._loco_root_unavailable_since = 0
+        return LoCo(_ensure_loco_response(path_response, 'the LoCo root menu'))
 
     @cache_utils.cache_output(cache_utils.CACHE_GENRES, identify_from_kwarg_name='genre_id', ignore_self_class=True)
     def req_loco_list_genre(self, genre_id):
@@ -1030,11 +1543,29 @@ class DirectoryPathRequests:
                   ['profilesList', 'current', 'summary'],
                   ['profilesList', {'to': 5}, 'summary'],
                   ['profilesList', {'to': 5}, 'avatar', 'images', 'byWidth', 320]])
-        path_response = self.nfsession.path_request(paths)
+        try:
+            path_response = self.nfsession.path_request(paths)
+        except req_exceptions.HTTPError as exc:
+            if getattr(exc.response, 'status_code', None) not in (404, 410, 412):
+                raise
+            LOG.warn('Falling back to the GraphQL profiles summary after pathEvaluator {}',
+                     exc.response.status_code)
+            return self._req_profiles_info_graphql(update_database)
         if update_database:
             from resources.lib.utils.website import parse_profiles
             parse_profiles(path_response)
         return path_response
+
+    def _req_profiles_info_graphql(self, update_database=True):
+        """Read the profiles with the summary query the website uses"""
+        data = self._post_graphql('useProfilesSummaryQuery',
+                                  {'profileIconSize': 'SQUARE_320'},
+                                  GRAPHQL_OP_PROFILES_SUMMARY)
+        response = {'data': data}
+        if update_database:
+            from resources.lib.utils.website import parse_profiles_summary
+            parse_profiles_summary(response)
+        return response
 
     @cache_utils.cache_output(cache_utils.CACHE_COMMON, identify_append_from_kwarg_name='perpetual_range_start',
                               ignore_self_class=True)
@@ -1050,14 +1581,15 @@ class DirectoryPathRequests:
             'length_params': ['stdlist_wid', ['videos', videoid.tvshowid, 'seasonList']],
             'perpetual_range_start': perpetual_range_start
         }
+        # The website asks the season selector, the path request is the previous way
         try:
-            path_response = self.nfsession.perpetual_path_request(**call_args)
-            return SeasonList(videoid, path_response)
-        except req_exceptions.HTTPError as exc:
-            if getattr(exc.response, 'status_code', None) != 404:
-                raise
-            LOG.warn('Falling back to GraphQL season selector for show {}', videoid.tvshowid)
             return self._req_seasons_graphql(videoid)
+        except (KeyError, TypeError, ValueError, IndexError, APIError,
+                req_exceptions.RequestException) as exc:
+            LOG.warn('Season selector failed for show {} ({}), trying the previous request',
+                     videoid.tvshowid, type(exc).__name__)
+        path_response = self.nfsession.perpetual_path_request(**call_args)
+        return SeasonList(videoid, path_response)
 
     @cache_utils.cache_output(cache_utils.CACHE_COMMON, identify_from_kwarg_name='videoid',
                               identify_append_from_kwarg_name='perpetual_range_start', ignore_self_class=True)
@@ -1075,14 +1607,15 @@ class DirectoryPathRequests:
             'length_params': ['stdlist_wid', ['seasons', videoid.seasonid, 'episodes']],
             'perpetual_range_start': perpetual_range_start
         }
+        # The website asks the episode selector, the path request is the previous way
         try:
-            path_response = self.nfsession.perpetual_path_request(**call_args)
-            return EpisodeList(videoid, path_response)
-        except req_exceptions.HTTPError as exc:
-            if getattr(exc.response, 'status_code', None) != 404:
-                raise
-            LOG.warn('Falling back to GraphQL episode selector for season {}', videoid.seasonid)
             return self._req_episodes_graphql(videoid)
+        except (KeyError, TypeError, ValueError, IndexError, APIError,
+                req_exceptions.RequestException) as exc:
+            LOG.warn('Episode selector failed for season {} ({}), trying the previous request',
+                     videoid.seasonid, type(exc).__name__)
+        path_response = self.nfsession.perpetual_path_request(**call_args)
+        return EpisodeList(videoid, path_response)
 
     def _post_graphql(self, operation_name, variables, operation_id):
         payload = {
@@ -1189,10 +1722,15 @@ class DirectoryPathRequests:
             episodes=episodes)
 
     def _browse_html_and_auth_url(self):
+        cached = self._browse_page_cache
+        if cached and time.monotonic() - cached[0] < BROWSE_PAGE_CACHE_SECS:
+            self.nfsession.auth_url = cached[2]
+            return cached[1], cached[2]
         browse_html = self.nfsession.get_safe('browse')
         api_data = self.nfsession.website_extract_session_data(browse_html)
         self.nfsession.auth_url = api_data['auth_url']
         browse_text = browse_html.decode('utf-8', 'replace') if isinstance(browse_html, bytes) else browse_html
+        self._browse_page_cache = (time.monotonic(), browse_text, api_data['auth_url'])
         return browse_text, api_data['auth_url']
 
     def _get_current_loco_root_id(self):
@@ -1200,6 +1738,8 @@ class DirectoryPathRequests:
         match = LOCO_ROOT_ID_RE.search(browse_html)
         if match:
             return match.group(0), auth_url
+        LOG.info('LOCO ROOT: no root id in the browse page ({} bytes), probing the candidates',
+                 len(browse_html))
         root_id = self._probe_current_loco_root_id(self._loco_root_candidates(browse_html), auth_url)
         if not root_id:
             raise InvalidVideoListTypeError('No current LoCo root id found in browse page')
@@ -1340,23 +1880,81 @@ class DirectoryPathRequests:
         path_response = self._post_browser_path_evaluator(
             self._browser_loco_paths(['lolomoByCategory', category_name]),
             'https://www.netflix.com/latest')
-        return LoLoMoCategory(path_response)
+        return LoLoMoCategory(_ensure_loco_response(path_response, f'category {category_name}'))
 
     def _req_browser_genre_loco(self, genre_id):
         self._browse_html_and_auth_url()
+        referer = f'https://www.netflix.com/browse/genre/{genre_id}'
         path_response = self._post_browser_path_evaluator(
             self._browser_loco_paths(['genres', int(genre_id), 'rw'], include_genre_paths=True),
-            f'https://www.netflix.com/browse/genre/{genre_id}')
-        return LoCo(path_response)
+            referer)
+        self._append_browser_genre_other_rows(path_response, genre_id, referer)
+        return LoCo(_ensure_loco_response(path_response, f'genre {genre_id}'))
+
+    def _append_browser_genre_other_rows(self, path_response, genre_id, referer):
+        """Ask the rows of a genre page after the fourth, the website asks them apart"""
+        # The reference is a list, ['locos', '<id>'], and get_path_safe cannot
+        # index a list: it turns every step of the path into a string
+        rw_reference = common.get_path_safe(['genres', str(genre_id), 'rw', 'value'],
+                                            path_response, False, None)
+        if not isinstance(rw_reference, list) or len(rw_reference) < 2:
+            LOG.warn('The genre {} does not carry the reference of its rows', genre_id)
+            return
+        root_id = rw_reference[1]
+        length = common.get_path_safe(
+            ['locos', root_id, 'componentSummary', 'value', 'length'], path_response, False, 0) or 0
+        first_other_row = len(BROWSER_LOCO_ROW_KEYS) - 1
+        if length <= first_other_row:
+            return
+        row_range = {'from': first_other_row, 'to': min(length - 1, LOCO_ROW_RANGE['to'])}
+        root_path = ['locos', root_id]
+        paths = [
+            root_path + [row_range, 'componentSummary'],
+            root_path + [row_range, 'page', 0, LOCO_PAGE_RANGE, 'itemSummary'],
+            *_browser_reference_paths(root_path + [row_range, 'page', 0, LOCO_PAGE_RANGE,
+                                                   'reference'])
+        ]
+        try:
+            other_rows = self._post_browser_path_evaluator(paths, referer)
+        except req_exceptions.RequestException as exc:
+            LOG.warn('The other rows of the genre {} are not available ({})',
+                     genre_id, type(exc).__name__)
+            return
+        common.merge_dicts(other_rows, path_response)
+        LOG.info('GENRE ROWS: the genre {} exposes {} rows', genre_id, length)
 
     def _browser_video_list_by_id(self, list_id):
         self._browse_html_and_auth_url()
+        referer = 'https://www.netflix.com/browse'
         path_response = self._post_browser_path_evaluator_with_fallback(
             self._browser_video_list_paths(str(list_id), include_metadata=True),
             self._browser_video_list_paths(str(list_id)),
-            'https://www.netflix.com/browse',
+            referer,
             f'Browser list {list_id}')
+        self._append_browser_list_other_items(path_response, str(list_id), referer)
         return VideoList(path_response, str(list_id))
+
+    def _append_browser_list_other_items(self, path_response, list_id, referer):
+        """Ask the items of a list after the first page, the website asks only the first"""
+        length = common.get_path_safe(
+            ['lists', list_id, 'componentSummary', 'value', 'length'], path_response, False, 0) or 0
+        first_other_item = LOCO_PAGE_RANGE['to'] + 1
+        if length <= first_other_item:
+            return
+        item_range = {'from': first_other_item,
+                      'to': min(length - 1, PATH_REQUEST_SIZE_MAX)}
+        base_path = ['lists', list_id, 'page', 0, item_range]
+        paths = [base_path + ['itemSummary'],
+                 *_browser_reference_paths(base_path + ['reference'])]
+        try:
+            other_items = self._post_browser_path_evaluator(paths, referer)
+        except req_exceptions.RequestException as exc:
+            LOG.warn('The other items of the list {} are not available ({})',
+                     list_id, type(exc).__name__)
+            return
+        common.merge_dicts(other_items, path_response)
+        LOG.info('LIST ITEMS: the list {} holds {} items, asked up to {}',
+                 list_id, length, item_range['to'])
 
     def _browser_mylist_loco_response(self, root_id, auth_url, row_range):
         return self._post_current_loco_paths([
@@ -1454,15 +2052,38 @@ class DirectoryPathRequests:
                          exc.response.status_code)
         raise InvalidVideoListTypeError('No current direct My List content available')
 
+    def _browser_mylist_page(self, page_range, with_summary=False):
+        paths = [['mylist', page_range, BROWSER_MYLIST_FIELDS]]
+        if with_summary:
+            paths.insert(0, ['mylist', ['id', 'listId', 'name', 'requestId', 'trackIds']])
+        return self._post_browser_path_evaluator(paths, 'https://www.netflix.com/browse/my-list')
+
     def _browser_mylist_video_list(self):
         self._browse_html_and_auth_url()
-        path_response = self._post_browser_path_evaluator([
-            ['mylist', ['id', 'listId', 'name', 'requestId', 'trackIds']],
-            ['mylist', BROWSER_MYLIST_RANGE, BROWSER_MYLIST_FIELDS]
-        ], 'https://www.netflix.com/browse/my-list')
+        path_response = self._browser_mylist_page(BROWSER_MYLIST_RANGE, with_summary=True)
         mylist_data = path_response.get('mylist')
         if not isinstance(mylist_data, dict):
             raise InvalidVideoListTypeError('No browser My List data available')
+        # The website pages My List and stops as soon as a page comes back short
+        page_from, page_to = BROWSER_MYLIST_RANGE['from'], BROWSER_MYLIST_RANGE['to']
+        for _page in range(BROWSER_MYLIST_MAX_PAGES - 1):
+            if not _browser_mylist_is_full_page(mylist_data, page_from, page_to):
+                break
+            page_from, page_to = page_to + 1, page_to + BROWSER_MYLIST_PAGE_SIZE
+            page_range = {'from': page_from, 'to': page_to}
+            try:
+                page_response = self._browser_mylist_page(page_range)
+            except req_exceptions.HTTPError as exc:
+                if getattr(exc.response, 'status_code', None) not in (404, 412):
+                    raise
+                LOG.warn('My List page {} returned {}; using the items collected so far',
+                         page_range, exc.response.status_code)
+                break
+            page_data = page_response.get('mylist')
+            if not isinstance(page_data, dict):
+                break
+            mylist_data.update(page_data)
+            path_response.setdefault('videos', {}).update(page_response.get('videos', {}))
         path_response['lists'] = {'mylist': mylist_data}
         _normalize_browser_video_fields(path_response)
         video_list = VideoList(path_response, 'mylist')
@@ -1591,6 +2212,125 @@ class DirectoryPathRequests:
         LOG.debug('GraphQL Top Picks returned {} personalized videos', len(videos))
         return CustomVideoList({'videos': videos})
 
+    def _browser_home_graphql_data(self):
+        """Return the GraphQL cache of the home page of the active profile"""
+        LOG.debug('HOME ROWS: requesting the browse page')
+        browse_html = self.nfsession.get_safe('browse')
+        LOG.debug('HOME ROWS: browse page received ({} bytes), parsing', len(browse_html or b''))
+        graphql_data = self._browser_graphql_data(browse_html)
+        sections = _home_carousel_sections(graphql_data)
+        LOG.info('HOME ROWS: {} cache entries, {} carousel sections', len(graphql_data), len(sections))
+        if sections:
+            return graphql_data
+        LOG.info('HOME ROWS: no sections on the browse page, trying the active profile page')
+        try:
+            browse_html = self._active_profile_browse_html(browse_html)
+        except InvalidVideoListTypeError:
+            return graphql_data
+        graphql_data = self._browser_graphql_data(browse_html)
+        LOG.info('HOME ROWS: active profile page has {} cache entries, {} carousel sections',
+                 len(graphql_data), len(_home_carousel_sections(graphql_data)))
+        return graphql_data
+
+    def _iter_home_sections(self, graphql_data):
+        """Yield the home page rows, the ones in the page then the ones loaded on scroll"""
+        yield from _home_carousel_sections(graphql_data)
+        page_id, cursor, has_next_page = _home_sections_page_info(graphql_data)
+        if not page_id:
+            LOG.info('HOME ROWS: the page has no sections cursor, only the page rows are available')
+            return
+        for _page in range(FETCH_MORE_SECTIONS_MAX_PAGES):
+            if not (has_next_page and cursor):
+                return
+            try:
+                data = self._post_graphql('FetchMoreSections',
+                                          _fetch_more_sections_variables(page_id, cursor),
+                                          GRAPHQL_OP_FETCH_MORE_SECTIONS)
+            except req_exceptions.RequestException as exc:
+                LOG.warn('HOME ROWS: FetchMoreSections failed ({}); using the rows collected so far',
+                         type(exc).__name__)
+                return
+            connection = ((data.get('page') or {}).get('sections') or {})
+            edges = _iter_graphql_edges(connection)
+            found = False
+            for edge in edges:
+                section = (edge or {}).get('node') or {}
+                if section.get('__typename') != 'PinotCarouselSection':
+                    continue
+                if not str(section.get('displayString') or '').strip():
+                    continue
+                entities = section.get('entities') or {}
+                if not any(True for _entity_edge in _iter_graphql_edges(entities)):
+                    continue
+                found = True
+                yield str(section.get('id') or ''), section, entities
+            page_info = connection.get('pageInfo') or {}
+            cursor = page_info.get('endCursor')
+            has_next_page = bool(page_info.get('hasNextPage'))
+            if not found and not has_next_page:
+                return
+        else:
+            if has_next_page:
+                LOG.warn('HOME ROWS: stopped after {} FetchMoreSections pages, Netflix has more rows',
+                         FETCH_MORE_SECTIONS_MAX_PAGES)
+
+    def req_home_rows(self):
+        """Return the rows of the Netflix home page, in the order the website shows them"""
+        graphql_data = self._browser_home_graphql_data()
+        rows = []
+        for index, (section_id, section, connection) in enumerate(self._iter_home_sections(graphql_data)):
+            rows.append({
+                'index': index,
+                'id': _home_section_key(section_id),
+                'name': str(section.get('displayString')),
+                'total': connection.get('totalCount') or 0
+            })
+        if not rows:
+            _log_carousel_sections(graphql_data)
+            raise InvalidVideoListTypeError('No Netflix home rows available')
+        LOG.info('HOME ROWS: the Netflix home page exposes {} rows', len(rows))
+        return rows
+
+    def req_home_row_videos(self, row_index, row_id=None):
+        """Return the videos of a single row of the Netflix home page"""
+        graphql_data = self._browser_home_graphql_data()
+        index = int(str(row_index).rsplit('_', 1)[-1])
+        match = None
+        fallback = None
+        for position, item in enumerate(self._iter_home_sections(graphql_data)):
+            if row_id and _home_section_key(item[0]) == row_id:
+                match = item
+                break
+            if position == index:
+                fallback = item
+                if not row_id:
+                    match = item
+                    break
+        match = match or fallback
+        if match is None:
+            raise InvalidVideoListTypeError(f'Netflix home row {row_index} is no longer available')
+        section_id, section, connection = match
+        videos = OrderedDict()
+        self._append_standard_graphql_edges(videos, graphql_data, _iter_graphql_edges(connection))
+        page_info = connection.get('pageInfo') or {}
+        while page_info.get('hasNextPage') and page_info.get('endCursor'):
+            data = self._post_graphql(
+                'CarouselPage',
+                _carousel_graphql_variables(section.get('_id') or section.get('id') or section_id,
+                                            page_info['endCursor']),
+                GRAPHQL_OP_CAROUSEL_PAGE)
+            next_connection = (data.get('node') or {}).get('entities') or {}
+            previous_count = len(videos)
+            self._append_standard_graphql_edges(videos, {}, _iter_graphql_edges(next_connection))
+            page_info = next_connection.get('pageInfo') or {}
+            if len(videos) == previous_count:
+                break
+        if not videos:
+            raise InvalidVideoListTypeError(f'Netflix home row {row_index} has no videos')
+        LOG.info('HOME ROWS: row {} "{}" returned {} of {} videos', row_index,
+                 section.get('displayString'), len(videos), connection.get('totalCount') or 0)
+        return CustomVideoList({'videos': videos})
+
     def _browser_graphql_carousel_section(self, section_resolver):
         browse_html = self.nfsession.get_safe('browse')
         graphql_data = self._browser_graphql_data(browse_html)
@@ -1641,6 +2381,7 @@ class DirectoryPathRequests:
                 node = _graphql_ref_node(graphql_data, (edge_data or {}).get('node'))
                 if isinstance(node, dict) and node.get('__typename') == 'PinotContinueWatchingEntityTreatment':
                     return section, connection
+        _log_carousel_sections(graphql_data)
         raise InvalidVideoListTypeError('No GraphQL Continue Watching section available')
 
     @staticmethod
@@ -1864,21 +2605,28 @@ class DirectoryPathRequests:
             'length_params': ['stdlist', ['lists', list_id]],
             'perpetual_range_start': perpetual_range_start
         }
-        try:
-            path_response = self.nfsession.perpetual_path_request(**call_args)
-        except req_exceptions.HTTPError as exc:
-            if getattr(exc.response, 'status_code', None) != 404:
-                raise
-            initial_menu_id = (menu_data or {}).get('initial_menu_id')
-            if initial_menu_id in ('newAndPopular', 'recommendations'):
-                LOG.warn('Falling back to browser-shaped LoLoMo category list {} after pathEvaluator 404', list_id)
-                return self._browser_lolomo_video_list_by_id('comingSoon', list_id)
-            LOG.warn('Falling back to browser-shaped list {} after pathEvaluator 404', list_id)
+        if not self.refused_video_list_fields:
             try:
-                return self._browser_video_list_by_id(list_id)
-            except req_exceptions.HTTPError:
-                return self._current_loco_list_by_id(list_id)
-        return VideoList(path_response)
+                return VideoList(self.nfsession.perpetual_path_request(**call_args))
+            except req_exceptions.HTTPError as exc:
+                if getattr(exc.response, 'status_code', None) != 404:
+                    raise
+                self.refused_video_list_fields = True
+                LOG.warn('The reference fields of the list {} were refused (404), '
+                         'the next lists ask the browser-shaped one straight away', list_id)
+        return self._browser_shaped_video_list(list_id, menu_data)
+
+    def _browser_shaped_video_list(self, list_id, menu_data):
+        """Ask a list the way the website asks it, the reference fields are refused"""
+        initial_menu_id = (menu_data or {}).get('initial_menu_id')
+        if initial_menu_id in ('newAndPopular', 'recommendations'):
+            LOG.warn('Asking the browser-shaped LoLoMo category list {}', list_id)
+            return self._browser_lolomo_video_list_by_id('comingSoon', list_id)
+        LOG.warn('Asking the browser-shaped list {}', list_id)
+        try:
+            return self._browser_video_list_by_id(list_id)
+        except req_exceptions.HTTPError:
+            return self._current_loco_list_by_id(list_id)
 
     @cache_utils.cache_output(cache_utils.CACHE_COMMON, identify_from_kwarg_name='context_id',
                               identify_append_from_kwarg_name='perpetual_range_start', ignore_self_class=True)
@@ -1920,18 +2668,55 @@ class DirectoryPathRequests:
         paths = (build_paths(_base_path, VIDEO_LIST_PARTIAL_PATHS) +
                  [base_path[:-1] + [['id', 'name', 'requestId', 'trackIds']]])
 
-        try:
-            path_response = self.nfsession.perpetual_path_request(paths, [response_type, base_path], perpetual_range_start)
-        except req_exceptions.HTTPError as exc:
-            status_code = getattr(exc.response, 'status_code', None)
-            if status_code not in (404, 412):
-                raise
+        length_params = [response_type, base_path]
+        if context_name in self.refused_sorted_fields:
+            path_response = self._sorted_list_website_fields(base_path, length_params,
+                                                             perpetual_range_start, context_id, None)
+        else:
+            path_response = None
+            try:
+                path_response = self.nfsession.perpetual_path_request(paths, length_params,
+                                                                      perpetual_range_start)
+            except req_exceptions.HTTPError as exc:
+                status_code = getattr(exc.response, 'status_code', None)
+                if status_code not in (404, 412):
+                    raise
+                self.refused_sorted_fields.add(context_name)
+                path_response = self._sorted_list_website_fields(base_path, length_params,
+                                                                 perpetual_range_start, context_id,
+                                                                 status_code)
+        if path_response is None:
             context = SORTED_LIST_CONTEXT_FALLBACKS.get((context_name, str(context_id)))
             if context_name != 'genres' and not context:
-                raise
-            LOG.warn('Falling back to browser-shaped genre {} after pathEvaluator {}', context_id, status_code)
+                raise InvalidVideoListTypeError(f'No list available for {context_id}')
+            LOG.warn('Falling back to browser-shaped genre {} after the fields were refused',
+                     context_id)
             return self._first_full_browser_genre_video_list(context_id)
         return VideoListSorted(path_response, context_name, context_id, req_sort_order_type)
+
+    def _sorted_list_website_fields(self, base_path, length_params, perpetual_range_start,
+                                    context_id, status_code):
+        """Ask the sorted list with the fields the website asks, None if it is refused too"""
+        if status_code is None:
+            LOG.debug('Asking the sorted list {} with the fields of the website', context_id)
+        else:
+            LOG.warn('The fields of the sorted list {} were refused ({}), '
+                     'asking the ones the website asks', context_id, status_code)
+        try:
+            path_response = self.nfsession.perpetual_path_request(
+                _browser_sorted_list_paths(base_path), length_params, perpetual_range_start)
+        except req_exceptions.HTTPError as exc:
+            if getattr(exc.response, 'status_code', None) not in (404, 412):
+                raise
+            return None
+        if not path_response:
+            return None
+        _normalize_browser_sorted_fields(path_response, base_path)
+        # The website does not ask the cast and the genres of the items of a grid,
+        # asking them one by one costs a request per item and the listing times out
+        path_response['_website_fields'] = True
+        LOG.info('SORTED LIST: the list {} was read with the fields of the website', context_id)
+        return path_response
 
 
     @cache_utils.cache_output(cache_utils.CACHE_COMMON, identify_from_kwarg_name='context_id',
@@ -1960,7 +2745,24 @@ class DirectoryPathRequests:
         paths = (build_paths(_base_path, VIDEO_LIST_PARTIAL_PATHS) +
                  [base_path[:-1] + [['id', 'name', 'requestId', 'trackIds']]])
 
-        path_response = self.nfsession.perpetual_path_request(paths, [response_type, ['videos']], perpetual_range_start)
+        length_params = [response_type, ['videos']]
+        if context_name in self.refused_sorted_fields:
+            path_response = self._sorted_list_website_fields(base_path, length_params,
+                                                             perpetual_range_start, context_id, None)
+        else:
+            try:
+                path_response = self.nfsession.perpetual_path_request(paths, length_params,
+                                                                      perpetual_range_start)
+            except req_exceptions.HTTPError as exc:
+                status_code = getattr(exc.response, 'status_code', None)
+                if status_code not in (404, 412):
+                    raise
+                self.refused_sorted_fields.add(context_name)
+                path_response = self._sorted_list_website_fields(base_path, length_params,
+                                                                 perpetual_range_start, context_id,
+                                                                 status_code)
+        if path_response is None:
+            raise InvalidVideoListTypeError(f'No list available for {context_id}')
         return VideosList(path_response, [context_name, context_id])
 
     @cache_utils.cache_output(cache_utils.CACHE_SUPPLEMENTAL, identify_append_from_kwarg_name='supplemental_type',
@@ -2023,6 +2825,74 @@ class DirectoryPathRequests:
                 raise
             LOG.warn('Trailer supplemental path returned 404 for {}, trying title page fallback', videoid)
             return _title_page_fallback()
+
+    @cache_utils.cache_output(cache_utils.CACHE_COMMON, identify_from_kwarg_name='videoid',
+                              ttl=900, ignore_self_class=True)
+    def req_similar_video_list(self, videoid):
+        """Retrieve the titles the website suggests next to a video"""
+        similar_ids = self._similar_video_ids(videoid)
+        if not similar_ids:
+            raise InvalidVideoListTypeError(f'No similar titles for {videoid}')
+        try:
+            return self._similar_video_list_graphql(similar_ids)
+        except (req_exceptions.RequestException, APIError, KeyError, TypeError,
+                ValueError) as exc:
+            LOG.warn('The suggested titles of {} are not available through GraphQL ({}), '
+                     'reading them the previous way', videoid, type(exc).__name__)
+        return self.req_video_list_chunked(
+            chunked_video_list=[[str(video_id) for video_id in similar_ids]])
+
+    def _similar_video_ids(self, videoid):
+        """The website reads the suggestions out of the detail of the video"""
+        video_id = int(videoid.value)
+        detail_data = self._post_graphql(
+            'DetailModal',
+            {
+                'artworkContext': {},
+                'checkLinearChannel': True,
+                'fetchPromoVideoOverride': False,
+                'hasPromoVideoOverride': False,
+                'isLiveEpisodic': False,
+                'opaqueImageFormat': 'WEBP',
+                'promoVideoId': 0,
+                'textEvidenceUiContext': 'ODP',
+                'transparentImageFormat': 'WEBP',
+                'unifiedEntityId': f'Video:{video_id}',
+                'videoId': video_id,
+                'videoMerchContext': 'BROWSE',
+                'videoMerchEnabled': False
+            },
+            GRAPHQL_OP_DETAIL_MODAL)
+        entity = (detail_data.get('unifiedEntities') or [None])[0] or {}
+        similar_ids = []
+        for similar in entity.get('similars') or []:
+            similar_id = (similar or {}).get('videoId')
+            if similar_id and similar_id != video_id and similar_id not in similar_ids:
+                similar_ids.append(similar_id)
+        LOG.info('SIMILARS: the video {} suggests {} titles', video_id, len(similar_ids))
+        return similar_ids
+
+    def _similar_video_list_graphql(self, similar_ids):
+        data = self._post_graphql(
+            'VideoDetailsModalSimilars',
+            {
+                'artworkContext': {},
+                'isKids': G.LOCAL_DB.get_profile_config('isKids', False),
+                'opaqueImageFormat': 'JPG',
+                'videoIds': similar_ids
+            },
+            GRAPHQL_OP_DETAIL_MODAL_SIMILARS)
+        videos = OrderedDict()
+        nodes_by_id = {str(node.get('videoId')): node
+                       for node in data.get('videos') or []
+                       if isinstance(node, dict) and node.get('videoId')}
+        for similar_id in similar_ids:
+            item = _similar_node_to_item(nodes_by_id.get(str(similar_id), {}))
+            if item:
+                videos[item[0]] = item[1]
+        if not videos:
+            raise InvalidVideoListTypeError('No suggested titles returned')
+        return CustomVideoList({'videos': videos})
 
     def _req_video_list_supplemental_graphql(self, videoid):
         """Load the website's ordered Trailers & More collection."""
@@ -2127,6 +2997,62 @@ class DirectoryPathRequests:
         if perpetual_range_selector:
             merged_response.update(perpetual_range_selector)
         return CustomVideoList(merged_response)
+
+    @cache_utils.cache_output(cache_utils.CACHE_COMMON, identify_from_kwarg_name='search_term',
+                              ttl=3600, ignore_self_class=True)
+    def req_search_suggestion_collections(self, search_term):
+        """Return the collections the website suggests for a search term"""
+        data = self._post_graphql('SearchPageQueryResults',
+                                  _search_graphql_variables(search_term),
+                                  GRAPHQL_OP_SEARCH)
+        collections = []
+        seen = set()
+        for section in ((data.get('page') or {}).get('sections') or {}).get('edges') or []:
+            entities = (section.get('node') or {}).get('entities') or {}
+            for edge in _iter_graphql_edges(entities):
+                node = edge.get('node') or {}
+                entity_id = node.get('suggestionEntityId') or ''
+                if not entity_id.startswith('Collection:') or entity_id in seen:
+                    continue
+                seen.add(entity_id)
+                collections.append({'id': entity_id,
+                                    'name': node.get('displayString') or entity_id})
+        LOG.info('SEARCH COLLECTIONS: "{}" suggests {} collections', search_term, len(collections))
+        if not collections:
+            raise InvalidVideoListTypeError(f'No collections suggested for "{search_term}"')
+        return collections
+
+    @cache_utils.cache_output(cache_utils.CACHE_COMMON, identify_from_kwarg_name='entity_id',
+                              ttl=900, ignore_self_class=True)
+    def req_search_entity_video_list(self, entity_id, display_string, query_string):
+        """Retrieve the videos of a collection the way the website asks them"""
+        videos = OrderedDict()
+        end_cursor = None
+        while True:
+            data = self._post_graphql(
+                'SearchPageEntityResults',
+                _search_entity_graphql_variables(entity_id, display_string, query_string, end_cursor),
+                GRAPHQL_OP_SEARCH_ENTITY)
+            connection = {}
+            for section in ((data.get('page') or {}).get('sections') or {}).get('edges') or []:
+                node = section.get('node') or {}
+                if node.get('entities'):
+                    connection = node['entities']
+                    break
+            previous_count = len(videos)
+            for edge in _iter_graphql_edges(connection):
+                item = _search_graphql_node_to_item(edge.get('node') or {})
+                if item:
+                    videos.setdefault(item[0], item[1])
+            page_info = connection.get('pageInfo') or {}
+            if (not page_info.get('hasNextPage') or not page_info.get('endCursor')
+                    or len(videos) == previous_count):
+                break
+            end_cursor = page_info['endCursor']
+        LOG.info('COLLECTION: {} ({}) holds {} videos', display_string, entity_id, len(videos))
+        if not videos:
+            raise InvalidVideoListTypeError(f'No videos available in {entity_id}')
+        return CustomVideoList({'videos': videos})
 
     def req_video_list_search(self, search_term, perpetual_range_start=None):
         """Retrieve a video list by search term"""

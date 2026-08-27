@@ -26,11 +26,12 @@ from resources.lib.utils.logging import LOG, measure_exec_time_decorator
 # To add a new type: add the new type name to SEARCH_TYPES, then implement the new type to search_add/search_query.
 
 
-SEARCH_TYPES = ['text', 'audio_lang', 'subtitles_lang', 'genre_id']
+SEARCH_TYPES = ['text', 'audio_lang', 'subtitles_lang', 'dubbed_lang', 'genre_id']
 SEARCH_TYPES_DESC = {
     'text': common.get_local_string(30410),
     'audio_lang': common.get_local_string(30411),
     'subtitles_lang': common.get_local_string(30412),
+    'dubbed_lang': common.get_local_string(30414),
     'genre_id': common.get_local_string(30413)
 }
 
@@ -95,6 +96,8 @@ def search_add():
         row_id = _search_add_bylang(SEARCH_TYPES[type_index], api.get_available_audio_languages())
     elif search_type == 'subtitles_lang':
         row_id = _search_add_bylang(SEARCH_TYPES[type_index], api.get_available_subtitles_languages())
+    elif search_type == 'dubbed_lang':
+        row_id = _search_add_bylang(SEARCH_TYPES[type_index], api.get_available_dubbed_languages())
     elif search_type == 'genre_id':
         genre_id = ui.show_dlg_input_numeric(search_types_desc[type_index], mask_input=False)
         if genre_id:
@@ -202,7 +205,7 @@ def exec_query(row_id, search_type, search_params, search_value, perpetual_range
             'context_id': common.convert_from_string(search_params, dict)['lang_code']
         }
         dir_items, extra_data = common.make_call('get_video_list_sorted_sp', call_args)
-    elif search_type == 'subtitles_lang':
+    elif search_type in ('subtitles_lang', 'dubbed_lang'):
         call_args = {
             'menu_data': menu_data,
             'pathitems': ['search', 'search', row_id],

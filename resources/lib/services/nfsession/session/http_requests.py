@@ -28,6 +28,16 @@ from resources.lib.utils.logging import LOG, measure_exec_time_decorator
 
 
 GRAPHQL_URL = 'https://web.prod.cloud.netflix.com/graphql'
+# The account and identity operations are served by the website address
+ACCOUNT_GRAPHQL_URL = 'https://www.netflix.com/graphql'
+
+# Endpoints removed by Netflix, refreshing the session cannot make them work again
+# and would wrongly invalidate the stored credentials
+RETIRED_ENDPOINTS = ['profile_hub']
+
+# Netflix has retired several pathEvaluator paths, their 404 is not caused by an expired session,
+# refreshing it again for every request only slows down the navigation
+SESSION_REFRESH_MIN_INTERVAL_SECS = 60
 
 
 class SessionHTTPRequests(SessionBase):
@@ -48,8 +58,13 @@ class SessionHTTPRequests(SessionBase):
             **kwargs)
 
     @measure_exec_time_decorator(is_immediate=True)
-    def post_graphql(self, operation_name, variables, operation_id, referer=None):
-        """Execute a persisted GraphQL request against the website GraphQL gateway."""
+    def post_graphql(self, operation_name, variables, operation_id, referer=None, url=None,
+                     extra_headers=None):
+        """Execute a persisted GraphQL request against the website GraphQL gateway.
+
+        Netflix has two gateways: the content one is the default, the account and identity
+        operations are served by the website address instead.
+        """
         self.assert_logged_in()
         payload = {
             'operationName': operation_name,
@@ -58,10 +73,12 @@ class SessionHTTPRequests(SessionBase):
         }
         LOG.debug('Executing GraphQL request: {}', operation_name)
         start = time.perf_counter()
+        headers = _graphql_headers(referer)
+        headers.update(extra_headers or {})
         response = self.session.post(
-            url=GRAPHQL_URL,
+            url=url or GRAPHQL_URL,
             json=payload,
-            headers=_graphql_headers(referer),
+            headers=headers,
             timeout=8)
         LOG.debug('Request took {}s', time.perf_counter() - start)
         LOG.debug('Request returned status code {}', response.status_code)
@@ -129,10 +146,16 @@ class SessionHTTPRequests(SessionBase):
             # Error 401: This is a generic error, can happen when the http request for some reason has failed,
             #   we allow the refresh only for shakti endpoint, sometimes for unknown reasons it is necessary to update
             #   the session for the request to be successful
-            if response.status_code == 404 or (response.status_code == 401 and endpoint == 'shakti'):
-                LOG.warn('Attempt to refresh the session due to HTTP error {}', response.status_code)
-                if self.try_refresh_session_data():
-                    return self._request(method, endpoint, True, **kwargs)
+            if ((response.status_code == 404 and endpoint not in RETIRED_ENDPOINTS)
+                    or (response.status_code == 401 and endpoint == 'shakti')):
+                elapsed = time.monotonic() - getattr(self, '_last_session_refresh', 0)
+                if elapsed < SESSION_REFRESH_MIN_INTERVAL_SECS:
+                    LOG.debug('Session refreshed {}s ago, HTTP error {} is not caused by the session',
+                              int(elapsed), response.status_code)
+                else:
+                    LOG.warn('Attempt to refresh the session due to HTTP error {}', response.status_code)
+                    if self.try_refresh_session_data():
+                        return self._request(method, endpoint, True, **kwargs)
         if response.status_code == 401:
             raise HttpError401
         response.raise_for_status()
@@ -145,6 +168,7 @@ class SessionHTTPRequests(SessionBase):
         try:
             self.auth_url = website.extract_session_data(self.get('browse'))['auth_url']
             cookies.save(self.session.cookies)
+            self._last_session_refresh = time.monotonic()
             LOG.debug('Successfully refreshed session data')
             return True
         except MbrStatusError:

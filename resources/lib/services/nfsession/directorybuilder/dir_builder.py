@@ -17,8 +17,9 @@ from resources.lib.common import VideoId
 from resources.lib.globals import G
 from resources.lib.utils.api_paths import ART_SIZE_FHD, ART_SIZE_POSTER
 from resources.lib.services.nfsession.directorybuilder.dir_builder_items \
-    import (build_video_listing, build_subgenres_listing, build_season_listing, build_episode_listing,
-            build_loco_listing, build_mainmenu_listing, build_profiles_listing, build_lolomo_category_listing)
+    import (build_video_listing, build_subgenres_listing, build_collections_listing, build_season_listing, build_episode_listing,
+            build_loco_listing, build_mainmenu_listing, build_profiles_listing, build_lolomo_category_listing,
+            build_home_rows_listing)
 from resources.lib.services.nfsession.directorybuilder.dir_path_requests import (DirectoryPathRequests,
                                                                                  _has_reference_entries,
                                                                                  _metadata_has_reference_names,
@@ -51,13 +52,28 @@ class DirectoryBuilder(DirectoryPathRequests):
             self.get_subgenres,
             self.get_mylist_videoids_profile_switch,
             self.add_videoids_to_video_list_cache,
-            self.get_continuewatching_videoid_exists
+            self.get_continuewatching_videoid_exists,
+            self.get_home_rows,
+            self.get_home_row_videos,
+            self.get_collections,
+            self.get_collection_video_list,
+            self.get_similar_video_list
         ]
 
     @measure_exec_time_decorator(is_immediate=True)
     def get_mainmenu(self):
         loco_list = self.req_loco_list_root()
         return build_mainmenu_listing(loco_list)
+
+    @measure_exec_time_decorator(is_immediate=True)
+    def get_home_rows(self, menu_data):
+        return build_home_rows_listing(self.req_home_rows(), menu_data)
+
+    @measure_exec_time_decorator(is_immediate=True)
+    def get_home_row_videos(self, row_index, menu_data):
+        video_list = self.req_home_row_videos(row_index, menu_data.get('home_row_id'))
+        self._enrich_video_list_art(video_list, include_refs=True)
+        return build_video_listing(video_list, menu_data, mylist_items=self.req_mylist_items())
 
     @measure_exec_time_decorator(is_immediate=True)
     def get_profiles(self, request_update, preselect_guid=None, detailed_info=True):
@@ -155,7 +171,11 @@ class DirectoryBuilder(DirectoryPathRequests):
                                                     perpetual_range_start=perpetual_range_start,
                                                     menu_data=menu_data,
                                                     no_use_cache=menu_data.get('no_use_cache'))
-        self._enrich_video_list_art(video_list, include_refs=True)
+        # The lists read with the fields of the website carry no cast and no genres,
+        # asking them item by item would cost a request per item
+        website_fields = bool(getattr(video_list, 'data', {}).get('_website_fields'))
+        self._enrich_video_list_art(video_list, include_refs=not website_fields,
+                                    art_only=website_fields)
         return build_video_listing(video_list, menu_data, sub_genre_id, pathitems, perpetual_range_start,
                                    self.req_mylist_items())
 
@@ -329,6 +349,11 @@ class DirectoryBuilder(DirectoryPathRequests):
         return build_video_listing(video_list, menu_data, mylist_items=[])
 
     @measure_exec_time_decorator(is_immediate=True)
+    def get_similar_video_list(self, menu_data, video_id_dict):
+        video_list = self.req_similar_video_list(videoid=VideoId.from_dict(video_id_dict))
+        return build_video_listing(video_list, menu_data, mylist_items=[])
+
+    @measure_exec_time_decorator(is_immediate=True)
     def get_video_list_chunked(self, pathitems, menu_data, chunked_video_list, perpetual_range_selector):
         video_list = self.req_video_list_chunked(chunked_video_list, perpetual_range_selector=perpetual_range_selector)
         return build_video_listing(video_list, menu_data, pathitems=pathitems, mylist_items=self.req_mylist_items())
@@ -355,6 +380,19 @@ class DirectoryBuilder(DirectoryPathRequests):
             # Load the LoCo root list filtered by 'loco_contexts' specified in the menu_data
             loco_list = self.req_loco_list_root()
         return build_loco_listing(loco_list, menu_data, force_use_videolist_id)
+
+    @measure_exec_time_decorator(is_immediate=True)
+    def get_collections(self, menu_data, search_term):
+        collections = self.req_search_suggestion_collections(search_term=search_term)
+        return build_collections_listing(collections, menu_data)
+
+    @measure_exec_time_decorator(is_immediate=True)
+    def get_collection_video_list(self, menu_data, collection_id, collection_name, search_term,
+                                  pathitems):
+        video_list = self.req_search_entity_video_list(entity_id=collection_id,
+                                                       display_string=collection_name,
+                                                       query_string=search_term)
+        return build_video_listing(video_list, menu_data, pathitems=pathitems, mylist_items=[])
 
     @measure_exec_time_decorator(is_immediate=True)
     def get_subgenres(self, menu_data, genre_id):

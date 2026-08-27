@@ -165,6 +165,39 @@ def parse_profiles(data):
         raise InvalidProfilesError from exc
 
 
+def parse_profiles_summary(data):
+    """Parse the profiles from the GraphQL summary the website uses"""
+    profiles = common.get_path_safe(['data', 'account', 'profiles'], data, False, None)
+    if not profiles:
+        raise InvalidProfilesError('It has not been possible to obtain the list of profiles.')
+    # The summary does not say which profile is the current one, keep the one already active
+    active_guid = G.LOCAL_DB.get_active_profile_guid()
+    current_guids = []
+    for sort_order, profile in enumerate(profiles):
+        guid = profile.get('guid')
+        if not guid:
+            continue
+        current_guids.append(guid)
+        LOG.debug('Parsing profile {}', guid)
+        language = profile.get('primaryLanguage') or 'en-US'
+        summary = {
+            'profileName': parse_html(profile.get('name') or ''),
+            'avatar': common.get_path_safe(['icon', 'image', 'url'], profile, False, G.ICON) or G.ICON,
+            'isAccountOwner': bool(profile.get('isAccountOwner')),
+            'isKids': bool(profile.get('isKids')),
+            'isPinLocked': bool(profile.get('isPinLocked')),
+            'maturityLevel': common.get_path_safe(['maturityRating', 'level'], profile, False, 1000000),
+            'language': language,
+            'language_desc': xbmc.convertLanguage(language[:2], xbmc.ENGLISH_NAME)
+        }
+        G.LOCAL_DB.set_profile(guid, guid == active_guid, sort_order)
+        G.SHARED_DB.set_profile(guid, sort_order)
+        G.LOCAL_DB.insert_profile_configs(summary, guid)
+    if not current_guids:
+        raise InvalidProfilesError('It has not been possible to obtain the list of profiles.')
+    _delete_non_existing_profiles(current_guids)
+
+
 def _delete_non_existing_profiles(current_guids):
     list_guid = G.LOCAL_DB.get_guid_profiles()
     for guid in list_guid:
@@ -368,6 +401,66 @@ def extract_json(content, name):
         import traceback
         LOG.error(traceback.format_exc())
         raise WebsiteParsingError(f'Unable to extract {name}') from exc
+
+
+PC_MATURITY_ITEM_RE = recompile(r'data-uia="action-select-maturity-(\d+)"(.*?)(?=data-uia="action-select-maturity-|\Z)',
+                                DOTALL)
+PC_MATURITY_LABEL_RE = recompile(r'class="pin-rating-item"[^>]*>([^<]+)<')
+PC_MATURITY_TOOLTIP_RE = recompile(r'data-tooltip="([^"]*)"')
+PC_MATURITY_CHECKED_RE = recompile(r'data-uia="maturity-(\d+)-radio"\s+checked')
+
+
+def extract_auth_url(content):
+    """Extract the authURL from the page, it is required to send data to Netflix"""
+    html = content.decode('utf-8', 'replace') if isinstance(content, bytes) else str(content)
+    match = search(r'"authURL":"([^"]+)"', html)
+    if not match:
+        raise WebsiteParsingError('Unable to get the authURL of the page')
+    return decode_javascript_string(match.group(1))
+
+
+def extract_parental_control_page_data(content, guid):
+    """Extract the content of parental control data from the restrictions page"""
+    html = content.decode('utf-8', 'replace') if isinstance(content, bytes) else str(content)
+    rating_levels = []
+    current_level_index = 0
+    for index, match in enumerate(PC_MATURITY_ITEM_RE.finditer(html)):
+        value = int(match.group(1))
+        block = match.group(2)
+        labels = PC_MATURITY_LABEL_RE.findall(block)
+        tooltips = PC_MATURITY_TOOLTIP_RE.findall(block)
+        rating_levels.append({
+            'level': index,
+            'value': value,
+            'label': parse_html(labels[0]) if labels else str(value),
+            'description': parse_html(tooltips[0]) if tooltips else ''
+        })
+    if not rating_levels:
+        raise WebsiteParsingError('Unable to get maturity rating levels')
+    checked = PC_MATURITY_CHECKED_RE.search(html)
+    current_maturity = int(checked.group(1)) if checked else rating_levels[-1]['value']
+    for rating_level in rating_levels:
+        if rating_level['value'] == current_maturity:
+            current_level_index = rating_level['level']
+    profile = _extract_parental_control_profile(html, guid)
+    profile['maturity'] = current_maturity
+    return {'rating_levels': rating_levels,
+            'current_level_index': current_level_index,
+            'data': profile}
+
+
+def _extract_parental_control_profile(html, guid):
+    """Extract the data of the profile the restrictions page was requested for"""
+    match = search(r'"experience":"(\w+)","firstName":"((?:[^"\\]|\\.)*)","guid":"' + guid + '"', html)
+    experience = match.group(1) if match else 'standard'
+    profile_name = decode_javascript_string(match.group(2)) if match else ''
+    locked = search(r'"guid":"' + guid + r'"[^{]*?"isProfileLocked":(true|false)', html)
+    return {
+        # The page and the save request do not use the same words for the experience
+        'experience': 'just_for_kids' if experience == 'just_for_kids' else 'regular',
+        'isPinLocked': bool(locked and locked.group(1) == 'true'),
+        'profileInfo': {'guid': guid, 'profileName': parse_html(profile_name)}
+    }
 
 
 def extract_parental_control_data(content, current_maturity):

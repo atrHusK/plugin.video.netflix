@@ -7,6 +7,7 @@
     SPDX-License-Identifier: MIT
     See LICENSES/MIT.md for more information.
 """
+import json
 import time
 from datetime import datetime, timedelta
 
@@ -19,13 +20,18 @@ import resources.lib.utils.website as website
 from resources.lib.common import cache_utils
 from resources.lib.common.exceptions import (NotLoggedInError, MissingCredentialsError, WebsiteParsingError,
                                              MbrStatusAnonymousError, MetadataNotAvailable, LoginValidateError,
-                                             InvalidProfilesError, ErrorMsgNoReport, CacheMiss)
+                                             InvalidProfilesError, ErrorMsgNoReport, CacheMiss, APIError)
 from resources.lib.globals import G
 from resources.lib.kodi import ui
 from resources.lib.services.nfsession.directorybuilder.dir_path_requests import (_metadata_image_url,
                                                                                 _metadata_trailer_url,
                                                                                 metadata_with_title_page_fallback,
                                                                                 normalize_metadata_references)
+from resources.lib.database.db_utils import TABLE_SESSION
+from resources.lib.services.nfsession.session.access import (BROWSER_HEADERS, MFA_NEXT_NODE_ID,
+                                                            clcs_context_headers)
+from resources.lib.services.nfsession.session.endpoints import BASE_URL
+from resources.lib.services.nfsession.session.http_requests import ACCOUNT_GRAPHQL_URL
 from resources.lib.services.nfsession.session.path_requests import SessionPathRequests
 from resources.lib.utils import cookies
 from resources.lib.utils.api_paths import (EPISODES_PARTIAL_PATHS, ART_PARTIAL_PATHS, build_paths,
@@ -55,6 +61,11 @@ def _is_playable_direct_trailer_url(trailer_url):
         return False
 
 
+GRAPHQL_OP_SET_PROFILE_PIN = 'd1528f2f-ed01-4dc1-b870-ee91bb2c3850'
+GRAPHQL_OP_PROFILE_LOCK_TEMPLATE = 'd821963d-5bb5-43c7-a2d1-2cf7eab9f44e'
+GRAPHQL_OP_REMOVE_PROFILE_PIN = 'f490f470-b47c-4788-98e0-b13dac06f611'
+
+
 class NFSessionOperations(SessionPathRequests):
     """Provides methods to perform operations within the Netflix session"""
 
@@ -75,6 +86,8 @@ class NFSessionOperations(SessionPathRequests):
             self.refresh_session_data,
             self.activate_profile,
             self.parental_control_data,
+            self.set_parental_control_data,
+            self.set_profile_lock,
             self.get_metadata,
             self.get_videoid_info,
             self.get_direct_trailer
@@ -135,8 +148,7 @@ class NFSessionOperations(SessionPathRequests):
             raise ErrorMsgNoReport('It is not possible select a profile while a video is playing.')
         LOG.info('Activating profile {}', guid)
         try:
-            # Use /SwitchProfile endpoint to switch the active profile server-side
-            self.get_safe('switch_profile', params={'tkn': guid})
+            self._switch_profile_request(guid)
             # Fetch browse page to get a fresh authURL for the new profile
             response = self.get_safe('browse')
             self.auth_url = website.extract_session_data(response)['auth_url']
@@ -146,32 +158,180 @@ class NFSessionOperations(SessionPathRequests):
         G.CACHE_MANAGEMENT.identifier_prefix = guid
         cookies.save(self.session.cookies)
 
-    def parental_control_data(self, guid, password):
-        # Ask to the service if password is right and get the PIN status
+    def _switch_profile_request(self, guid):
+        """Switch the active profile server-side, with the previous address as fallback"""
         from requests import exceptions
         try:
-            response = self.post_safe('profile_hub',
-                                      data={'destination': 'contentRestrictions',
-                                            'guid': guid,
-                                            'password': password,
-                                            'task': 'auth'})
-            if response.get('status') != 'ok':
-                LOG.warn('Parental control status issue: {}', response)
-                raise MissingCredentialsError
+            self.get_safe('switch_profile',
+                          params={'switchProfileGuid': guid, '_': int(time.time() * 1000)})
+            return
         except exceptions.HTTPError as exc:
-            if exc.response.status_code == 500:
-                # This endpoint raise HTTP error 500 when the password is wrong
-                raise MissingCredentialsError from exc
-            raise
+            if getattr(exc.response, 'status_code', None) not in (400, 401, 403, 404, 410):
+                raise
+            LOG.warn('Profile switch with the member api returned {}, using the previous address',
+                     exc.response.status_code)
+        self.get_safe('switch_profile_legacy', params={'tkn': guid})
+
+    def parental_control_data(self, guid, password):  # pylint: disable=unused-argument
         # Warning - parental control levels vary by country or region, no fixed values can be used
         # Note: The language of descriptions change in base of the language of selected profile
-        response_content = self.get_safe('restrictions',
-                                         data={'password': password},
-                                         append_to_address=guid)
-        extracted_content = website.extract_parental_control_data(response_content, response['maturity'])
-        response['profileInfo']['profileName'] = website.parse_html(response['profileInfo']['profileName'])
-        extracted_content['data'] = response
+        response = self._restrictions_page(guid)
+        if '/mfa' in response.url:
+            # Netflix asks to confirm the identity with the code that it sends by e-mail,
+            # the page reached by the redirect is the one that opens the check
+            LOG.debug('The restrictions page asks to verify the identity, starting the check')
+            self.verify_identity_mfa(guid, response)
+            response = self._restrictions_page(guid, from_identity_check=True)
+            LOG.info('MFA: after the check the restrictions page landed on {} through {}',
+                     response.url,
+                     [(r.status_code, r.headers.get('Location', '')[:90]) for r in response.history])
+            self.flush_mfa_feedback()
+            if '/mfa' in response.url:
+                # The website closes the check with the feedback, ask the page once more
+                response = self._restrictions_page(guid, from_identity_check=True)
+                LOG.info('MFA: after the closing feedback the page landed on {}', response.url)
+            if '/mfa' in response.url:
+                raise ErrorMsgNoReport('Netflix did not accept the identity check, '
+                                       'the settings cannot be changed.')
+        extracted_content = website.extract_parental_control_page_data(response.text, guid)
+        LOG.info('PARENTAL: {} levels available, the profile is on {}',
+                 len(extracted_content['rating_levels']),
+                 extracted_content['data']['maturity'])
+        extracted_content['data']['token'] = website.extract_auth_url(response.text)
         return extracted_content
+
+    def set_profile_lock(self, guid, pin):
+        """Set or remove the PIN that locks a profile"""
+        # Netflix names the two actions apart, and tells with the first call whether the
+        # identity has to be confirmed again or the change can be made straight away
+        action = 'EDIT_PROFILE_LOCK' if pin else 'DELETE_PROFILE_LOCK'
+        node = self._mfa_next_node(guid, action)
+        LOG.info('PROFILE LOCK: {} continues on {}', action, node)
+        if node == 'MFA_SELECT_FACTOR':
+            self.verify_identity_mfa_embedded(guid, 'MANAGE_PROFILE_LOCK', action)
+            # The website loads the page the check leads to and closes it with the feedback,
+            # the step is not finished until both are done
+            LOG.info('PROFILE LOCK: loading the page the check leads to')
+            pin_url = f'{BASE_URL}/settings/lock/pinentry/{guid}'
+            self.post_graphql('ProfileLockTemplate', {}, GRAPHQL_OP_PROFILE_LOCK_TEMPLATE,
+                              pin_url, ACCOUNT_GRAPHQL_URL,
+                              clcs_context_headers('ProfileLockTemplate', pin_url))
+            self.flush_mfa_feedback()
+            LOG.info('PROFILE LOCK: the check was closed, asking again')
+            node = self._mfa_next_node(guid, action)
+            LOG.info('PROFILE LOCK: after the check {} continues on {}', action, node)
+            if node == 'MFA_SELECT_FACTOR':
+                raise ErrorMsgNoReport('Netflix keeps asking to confirm the identity, '
+                                       'the profile lock cannot be changed.')
+        return self._post_profile_lock(guid, pin)
+
+    def _mfa_next_node(self, guid, growth_action):  # pylint: disable=unused-argument
+        """Ask Netflix what the next step of the journey is, it says if the identity is needed"""
+        page_url = f'{BASE_URL}/settings/lock/{guid}'
+        data = self.post_graphql('GrowthGetNextNodeForMfaFlow',
+                                 {'currentNode': 'MANAGE_PROFILE_LOCK',
+                                  'growthActionName': growth_action,
+                                  'sessionId': ''},
+                                 MFA_NEXT_NODE_ID, page_url, ACCOUNT_GRAPHQL_URL,
+                                 clcs_context_headers('GrowthGetNextNodeForMfaFlow', page_url))
+        return common.get_path_safe(
+            ['data', 'growthGetNextNodeForMfaFlow', 'userJourneyNodeName'], data, False, '')
+
+    def _post_profile_lock(self, guid, pin):
+        referer = f'{BASE_URL}/settings/lock/{guid}'
+        if pin:
+            data = self.post_graphql('UpdateProfileAccessPin',
+                                     {'profileGuid': guid,
+                                      'profilePin': str(pin),
+                                      'requirePinToCreateProfiles': False},
+                                     GRAPHQL_OP_SET_PROFILE_PIN, referer, ACCOUNT_GRAPHQL_URL,
+                                     clcs_context_headers('UpdateProfileAccessPin', referer))
+            result = common.get_path_safe(['data', 'growthSetProfilePin'], data, False, None)
+        else:
+            data = self.post_graphql('RemoveProfileAccessPin',
+                                     {'profileGuid': guid},
+                                     GRAPHQL_OP_REMOVE_PROFILE_PIN, referer, ACCOUNT_GRAPHQL_URL,
+                                     clcs_context_headers('RemoveProfileAccessPin', referer))
+            result = common.get_path_safe(['data', 'growthRemoveProfilePin'], data, False, None)
+        if not result:
+            LOG.warn('The profile lock was refused by Netflix: {}', data)
+            raise APIError('Netflix did not accept the change of the profile lock.')
+        LOG.info('PROFILE LOCK: the profile {} is now {}', guid, 'locked' if pin else 'unlocked')
+
+    def _restrictions_page(self, guid, from_identity_check=False):
+        # After the check the website reaches the page from the check page, keep the same referer
+        referer = (f'{BASE_URL}/mfa?guid={guid}' if from_identity_check
+                   else f'{BASE_URL}/account/profiles')
+        # Netflix ties the identity check to the browser that passed it, the page has to be
+        # asked with the same identity used by the check, not with the one of the add-on
+        headers = dict(BROWSER_HEADERS)
+        headers.update({'Referer': referer,
+                        'Sec-Fetch-Dest': 'document',
+                        'Sec-Fetch-Mode': 'navigate',
+                        'Sec-Fetch-Site': 'same-origin',
+                        'Sec-Fetch-User': '?1',
+                        'Upgrade-Insecure-Requests': '1'})
+        response = self.session.get(f'{BASE_URL}/settings/restrictions/{guid}',
+                                    headers=headers, allow_redirects=True, timeout=10)
+        response.raise_for_status()
+        return response
+
+    def set_parental_control_data(self, data):
+        """Save the maturity level of a profile"""
+        params = {
+            'landingURL': f'/settings/restrictions/{data["guid"]}',
+            'landingOrigin': BASE_URL,
+            'inapp': 'false',
+            'languages': G.LOCAL_DB.get_profile_config('language', 'en-US') or 'en-US',
+            'netflixClientPlatform': 'browser',
+            'method': 'call',
+            'callPath': '["aui","moneyball","next"]',
+            'falcor_server': '0.1.0'
+        }
+        payload = {
+            'flow': 'websiteMember',
+            'mode': 'maturityRating',
+            'action': 'saveAction',
+            'fields': {
+                'experience': {'value': data['experience']},
+                'maturity': {'value': int(data['maturity'])},
+                'profileGuid': {'value': data['guid']}
+            }
+        }
+        response = self.session.post(
+            f'{BASE_URL}/api/aui/pathEvaluator/web/%5E2.0.0',
+            params=params,
+            data={'authURL': data['token'],
+                  'tracingId': G.LOCAL_DB.get_value('ui_version', '', table=TABLE_SESSION),
+                  'tracingGroupId': 'www.netflix.com',
+                  'param': json.dumps(payload, separators=(',', ':'))},
+            headers={'Accept': '*/*',
+                     'Content-Type': 'application/x-www-form-urlencoded',
+                     'Origin': BASE_URL,
+                     'Referer': f'{BASE_URL}/settings/restrictions/{data["guid"]}',
+                     # Without the routing header the address is not served
+                     'x-netflix.request.routing':
+                         '{"path":"/nq/aui/endpoint/%5E1.0.0-web/pathEvaluator",'
+                         '"control_tag":"auinqweb"}',
+                     'x-netflix.nq.stack': 'prod',
+                     'x-netflix.client.request.name': 'ui/xhrUnclassified',
+                     'x-netflix.request.attempt': '1',
+                     'x-netflix.request.client.context': '{"appstate":"foreground"}',
+                     'X-Netflix.uiVersion': G.LOCAL_DB.get_value('ui_version', '', table=TABLE_SESSION),
+                     'X-Netflix.clientType': 'akira',
+                     'Sec-Fetch-Dest': 'empty',
+                     'Sec-Fetch-Mode': 'cors',
+                     'Sec-Fetch-Site': 'same-origin'},
+            timeout=10)
+        response.raise_for_status()
+        result = common.get_path_safe(
+            ['jsonGraph', 'aui', 'moneyball', 'next', 'value', 'result', 'fields', 'result', 'value'],
+            response.json(), False, False)
+        if not result:
+            LOG.warn('The maturity level was refused by Netflix: {}', response.text[:300])
+            raise ErrorMsgNoReport('Netflix did not accept the new maturity level.')
+        LOG.info('PARENTAL: the maturity level of the profile {} is now {}',
+                 data['guid'], data['maturity'])
 
     def website_extract_session_data(self, content, **kwargs):
         """Extract session data and handle errors"""

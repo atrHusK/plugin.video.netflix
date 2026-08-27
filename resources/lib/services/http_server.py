@@ -13,7 +13,8 @@ from socketserver import TCPServer, ThreadingMixIn
 from urllib.parse import urlparse, parse_qs, unquote
 
 from resources.lib.common import IPC_ENDPOINT_CACHE, IPC_ENDPOINT_NFSESSION, IPC_ENDPOINT_MSL, IPC_ENDPOINT_NFSESSION_TEST
-from resources.lib.common.exceptions import InvalidPathError, CacheMiss, MetadataNotAvailable, SlotNotImplemented
+from resources.lib.common.exceptions import (InvalidPathError, CacheMiss, MetadataNotAvailable,
+                                             SlotNotImplemented, MissingCredentialsError)
 from resources.lib.globals import G
 from resources.lib.services.nfsession.nfsession import NetflixSession
 from resources.lib.utils.logging import LOG
@@ -104,7 +105,7 @@ def handle_request(server, handler, func_name, data):
             raise SlotNotImplemented(f'The specified IPC slot {func_name} does not exist') from exc
         ret_data = _call_func(func, pickle.loads(data))
     except Exception as exc:  # pylint: disable=broad-except
-        if not isinstance(exc, (CacheMiss, MetadataNotAvailable)):
+        if not isinstance(exc, (CacheMiss, MetadataNotAvailable, MissingCredentialsError)):
             LOG.error('IPC callback raised exception: {exc}', exc=exc)
             import traceback
             LOG.error(traceback.format_exc())

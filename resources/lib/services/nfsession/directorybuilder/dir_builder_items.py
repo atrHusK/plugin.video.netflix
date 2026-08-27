@@ -200,6 +200,32 @@ def _create_episode_item(seasonid, episodeid_value, episode, episodes_list, comm
 
 
 @measure_exec_time_decorator(is_immediate=True)
+def build_home_rows_listing(rows, menu_data):
+    """Build a folders listing with the rows of the Netflix home page"""
+    directory_items = []
+    for row in rows:
+        # The key is prefixed to not collide with the genre ids stored in the same table
+        row_index = 'homerow_' + str(row['index'])
+        sub_menu_data = menu_data.copy()
+        sub_menu_data['path'] = ['home_row', menu_data['path'][1], row_index]
+        sub_menu_data['loco_known'] = False
+        sub_menu_data['loco_contexts'] = None
+        sub_menu_data['content_type'] = menu_data.get('content_type', G.CONTENT_SHOW)
+        sub_menu_data['title'] = row['name']
+        sub_menu_data['home_row_id'] = row['id']
+        sub_menu_data['initial_menu_id'] = menu_data.get('initial_menu_id', menu_data['path'][1])
+        sub_menu_data['no_use_cache'] = True
+        G.LOCAL_DB.set_value(row_index, sub_menu_data, TABLE_MENU_DATA)
+        list_item = ListItemW(label=row['name'])
+        list_item.setArt({'icon': menu_data.get('icon', 'DefaultFolder.png')})
+        if row['total']:
+            list_item.setInfo('video', {'Plot': f'{row["total"]} titles'})
+        directory_items.append(
+            (common.build_url(sub_menu_data['path'], mode=G.MODE_DIRECTORY), list_item, True))
+    G.CACHE_MANAGEMENT.execute_pending_db_ops()
+    return directory_items, {}
+
+
 def build_loco_listing(loco_list, menu_data, force_use_videolist_id=False):
     """Build a listing of video lists (LoCo)"""
     # If contexts are specified (loco_contexts in the menu_data), then the loco_list data will be filtered by
@@ -211,7 +237,9 @@ def build_loco_listing(loco_list, menu_data, force_use_videolist_id=False):
     directory_items = []
     for video_list_id, video_list in items_list:  # pylint: disable=unused-variable
         # Create dynamic sub-menu info in MAIN_MENU_ITEMS
-        if video_list['context'] == 'genre':
+        # Not every row of the website carries a context, the ones built from a
+        # configuration, "Crowd Pleasers" for one, carry only a display name
+        if video_list.get('context') == 'genre':
             menu_func_name = menu_data['path'][0]
             list_id = str(video_list['genreId'])
         else:
@@ -227,10 +255,10 @@ def build_loco_listing(loco_list, menu_data, force_use_videolist_id=False):
         if menu_data.get('path', [None])[0] == 'genres' and len(menu_data['path']) > 2:
             sub_menu_data['browser_genre_id'] = (
                 str(video_list['genreId'])
-                if video_list['context'] == 'genre'
+                if video_list.get('context') == 'genre'
                 else str(menu_data['path'][2]))
         # Do not use the cache with 'Top 10' menus, so that you always get up-to-date data.
-        sub_menu_data['no_use_cache'] = video_list['context'] == 'mostWatched'
+        sub_menu_data['no_use_cache'] = video_list.get('context') == 'mostWatched'
         G.LOCAL_DB.set_value(list_id, sub_menu_data, TABLE_MENU_DATA)
 
         directory_items.append(_create_videolist_item(list_id, video_list, sub_menu_data, common_data))
@@ -239,9 +267,9 @@ def build_loco_listing(loco_list, menu_data, force_use_videolist_id=False):
 
 
 def _create_videolist_item(list_id, video_list, menu_data, common_data, static_lists=False):
-    if static_lists and G.is_known_menu_context(video_list['context']):
+    if static_lists and G.is_known_menu_context(video_list.get('context')):
         pathitems = list(menu_data['path'])  # Make a copy
-        pathitems.append(video_list['context'])
+        pathitems.append(video_list.get('context'))
     else:
         # It is a dynamic video list / menu context
         if menu_data.get('force_use_videolist_id', False):
@@ -388,6 +416,32 @@ def _create_subgenre_item(video_list_id, subgenre_data, menu_data):
     return common.build_url(pathitems, mode=G.MODE_DIRECTORY), list_item, True
 
 
+def build_collections_listing(collections, menu_data):
+    """Build a folders listing of the collections of a search"""
+    directory_items = []
+    for collection in collections:
+        collection_id = collection['id']
+        # The id carries a colon, which does not survive the quoting of the url,
+        # so the path uses a plain key and the id travels in the menu data
+        collection_key = collection_id.replace(':', '_')
+        sub_menu_data = menu_data.copy()
+        sub_menu_data['path'] = [menu_data['path'][0], menu_data['path'][1], collection_key]
+        sub_menu_data['collection_id'] = collection_id
+        sub_menu_data['loco_known'] = False
+        sub_menu_data['loco_contexts'] = None
+        sub_menu_data['content_type'] = menu_data.get('content_type', G.CONTENT_SHOW)
+        sub_menu_data['title'] = collection['name']
+        sub_menu_data['collection_name'] = collection['name']
+        sub_menu_data['initial_menu_id'] = menu_data.get('initial_menu_id', menu_data['path'][1])
+        G.LOCAL_DB.set_value(collection_key, sub_menu_data, TABLE_MENU_DATA)
+        list_item = ListItemW(label=collection['name'])
+        pathitems = [menu_data['path'][0], menu_data['path'][1], collection_key]
+        directory_items.append(
+            (common.build_url(pathitems, mode=G.MODE_DIRECTORY), list_item, True))
+    G.CACHE_MANAGEMENT.execute_pending_db_ops()
+    return directory_items, {}
+
+
 def build_lolomo_category_listing(lolomo_cat_list, menu_data):
     """Build a folders listing of a LoLoMo category"""
     common_data = get_common_data()
@@ -404,7 +458,7 @@ def build_lolomo_category_listing(lolomo_cat_list, menu_data):
         sub_menu_data['title'] = summary_data['displayName']
         sub_menu_data['initial_menu_id'] = menu_data.get('initial_menu_id', menu_data['path'][1])
         # Do not use the cache with 'Top 10' menus, so that you always get up-to-date data.
-        sub_menu_data['no_use_cache'] = video_list['context'] == 'mostWatched'
+        sub_menu_data['no_use_cache'] = video_list.get('context') == 'mostWatched'
         G.LOCAL_DB.set_value(list_id, sub_menu_data, TABLE_MENU_DATA)
         directory_item = _create_category_item(list_id, video_list, sub_menu_data, common_data, summary_data)
         directory_items.append(directory_item)

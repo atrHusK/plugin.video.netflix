@@ -10,6 +10,7 @@
 import xbmcgui
 
 from resources.lib.globals import G
+from resources.lib.utils.logging import LOG
 
 ACTION_PREVIOUS_MENU = 10
 ACTION_PLAYER_STOP = 13
@@ -70,7 +71,13 @@ class ParentalControl(xbmcgui.WindowXMLDialog):
                     'maturity': self.rating_levels[self.current_level_index]['value'],
                     'token': self.data['token']}
             # Send changes to the service
-            api.set_parental_control_data(data)
+            try:
+                api.set_parental_control_data(data)
+            except Exception as exc:  # pylint: disable=broad-except
+                from resources.lib.kodi.ui import show_addon_error_info
+                LOG.error('Unable to save the maturity level: {}', exc)
+                show_addon_error_info(exc)
+                return
 
             # The selection of the maturity level affects the lists data as a filter,
             # so you need to clear the lists in the cache in order not to create inconsistencies

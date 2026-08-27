@@ -31,7 +31,10 @@ def generate_context_menu_profile(profile_guid, is_autoselect, is_autoselect_lib
         _ctx_item('profile_autoselect_library', None,
                   {**params, 'operation': 'remove' if is_autoselect_library else 'set'},
                   label_format='●' if is_autoselect_library else '○'),
-        _ctx_item('profile_parental_control', None, params)
+        _ctx_item('profile_parental_control', None, params),
+        _ctx_item('profile_lock', None,
+                  {**params, 'operation': 'remove' if is_pin_locked else 'set'},
+                  label_format='●' if is_pin_locked else '○')
     ]
     if is_pin_locked:
         items.append(_ctx_item('profile_remember_pin', None, params, label_format='●' if is_remember_pin else '○'))
@@ -79,6 +82,7 @@ def generate_context_menu_items(videoid, is_in_mylist, perpetual_range_start=Non
     if (videoid.mediatype != common.VideoId.SUPPLEMENTAL and
             videoid.mediatype in [common.VideoId.MOVIE, common.VideoId.SHOW]):
         items.insert(0, _ctx_item('trailer', videoid))
+        items.insert(0, _ctx_item('similar', videoid))
 
     if videoid.mediatype in [common.VideoId.MOVIE, common.VideoId.SHOW] and trackid is not None:
         list_action = 'remove_from_list' if is_in_mylist else 'add_to_list'
