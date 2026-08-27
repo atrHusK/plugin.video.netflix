@@ -363,8 +363,8 @@ def _episode_node_to_item(node, season_number, metadata=None):
 
 def _search_graphql_artwork_params():
     return {
-        'artworkType': 'SDP',
-        'dimension': {'width': 342, 'height': 192},
+        'artworkType': 'BOXSHOT',
+        'dimension': {'width': 300, 'height': 420},
         'features': {'fallbackStrategy': 'STILL'}
     }
 
@@ -1759,11 +1759,21 @@ class DirectoryPathRequests:
                     video_id, video_data = item
                     videos.setdefault(video_id, video_data)
         for video_id, video_data in list(videos.items()):
-            metadata_video = self._metadata_for_video(video_id, 'Search')
+            metadata_video = self._search_metadata_for_video(video_id)
             if metadata_video:
                 videos[video_id] = _merge_search_metadata_video(video_data, metadata_video)
-                normalize_metadata_references(path_response, video_id, metadata_video, videos[video_id])
+        LOG.debug('GraphQL search returned {} video results for "{}"', len(videos), search_term)
         return CustomVideoList(path_response)
+
+    def _search_metadata_for_video(self, video_id):
+        try:
+            metadata_data = self.nfsession.get_safe(
+                endpoint='metadata',
+                params={'movieid': video_id, '_': int(time.time() * 1000)})
+            return metadata_data.get('video') or {}
+        except (MetadataNotAvailable, KeyError, TypeError, req_exceptions.RequestException):
+            LOG.debug('Search metadata enrichment skipped for video {}', video_id)
+            return {}
 
     def _metadata_for_video(self, video_id, context):
         try:
