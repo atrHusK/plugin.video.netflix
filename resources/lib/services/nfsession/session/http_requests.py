@@ -27,6 +27,9 @@ from resources.lib.utils.esn import get_website_esn
 from resources.lib.utils.logging import LOG, measure_exec_time_decorator
 
 
+GRAPHQL_URL = 'https://web.prod.cloud.netflix.com/graphql'
+
+
 class SessionHTTPRequests(SessionBase):
     """Manages the HTTP requests"""
 
@@ -43,6 +46,30 @@ class SessionHTTPRequests(SessionBase):
             method='POST',
             endpoint=endpoint,
             **kwargs)
+
+    @measure_exec_time_decorator(is_immediate=True)
+    def post_graphql(self, operation_name, variables, operation_id, referer=None):
+        """Execute a persisted GraphQL request against the website GraphQL gateway."""
+        self.assert_logged_in()
+        payload = {
+            'operationName': operation_name,
+            'variables': variables,
+            'extensions': {'persistedQuery': {'id': operation_id, 'version': 102}}
+        }
+        LOG.debug('Executing GraphQL request: {}', operation_name)
+        start = time.perf_counter()
+        response = self.session.post(
+            url=GRAPHQL_URL,
+            json=payload,
+            headers=_graphql_headers(referer),
+            timeout=8)
+        LOG.debug('Request took {}s', time.perf_counter() - start)
+        LOG.debug('Request returned status code {}', response.status_code)
+        response.raise_for_status()
+        decoded_response = response.json() if response.content else {}
+        if decoded_response.get('errors'):
+            raise APIError(decoded_response['errors'][0].get('message'))
+        return decoded_response
 
     @measure_exec_time_decorator(is_immediate=True)
     def _request_call(self, method, endpoint, **kwargs):
@@ -248,6 +275,31 @@ def _add_path_evaluator_headers(headers):
     if website_esn:
         headers['X-Netflix.esn'] = website_esn
         headers['X-Netflix.esnPrefix'] = website_esn.rsplit('-', 1)[0] if '-' in website_esn else website_esn
+
+
+def _graphql_headers(referer=None):
+    """Add browser-equivalent metadata required by current website GraphQL requests."""
+    headers = {
+        'Accept': '*/*',
+        'Content-Type': 'application/json',
+        'Origin': BASE_URL,
+        'Referer': referer or f'{BASE_URL}/browse',
+        'x-netflix.nq.stack': 'prod',
+        'x-netflix.request.client.user.guid': G.LOCAL_DB.get_active_profile_guid()
+    }
+    _set_header_if_value(
+        headers, 'X-Netflix.browserVersion',
+        G.LOCAL_DB.get_value('browser_info_version', '', table=TABLE_SESSION))
+    _set_header_if_value(
+        headers, 'X-Netflix.osName',
+        G.LOCAL_DB.get_value('browser_info_os_name', '', table=TABLE_SESSION))
+    _set_header_if_value(
+        headers, 'X-Netflix.osVersion',
+        G.LOCAL_DB.get_value('browser_info_os_version', '', table=TABLE_SESSION))
+    _set_header_if_value(
+        headers, 'X-Netflix.uiVersion',
+        G.LOCAL_DB.get_value('ui_version', '', table=TABLE_SESSION))
+    return headers
 
 
 def _set_header_if_value(headers, name, value):

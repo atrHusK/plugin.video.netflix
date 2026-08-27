@@ -37,6 +37,7 @@ class NFSessionOperations(SessionPathRequests):
         self.slots = [
             self.get_safe,
             self.post_safe,
+            self.post_graphql,
             self.login,
             self.login_auth_data,
             self.logout,

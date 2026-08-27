@@ -98,7 +98,7 @@ class DirectoryBuilder(DirectoryPathRequests):
     @measure_exec_time_decorator(is_immediate=True)
     def get_video_list_sorted(self, pathitems, menu_data, sub_genre_id, perpetual_range_start, is_dynamic_id):
         context_id = None
-        if is_dynamic_id and pathitems[2] != 'None':
+        if is_dynamic_id and len(pathitems) > 2 and pathitems[2] != 'None':
             # Dynamic IDs for common video lists
             # The context_id can be:
             # -In the loco list: 'video list id'

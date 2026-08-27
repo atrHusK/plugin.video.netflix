@@ -18,6 +18,22 @@ from .logging import LOG, measure_exec_time_decorator
 from ..database.db_utils import TABLE_SESSION
 
 
+MY_LIST_GRAPHQL_MUTATIONS = {
+    'add': {
+        'operation_name': 'AddToPlaylist',
+        'operation_id': '8d985f07-2117-4add-980c-b83895549d1c',
+        'response_key': 'addEntityToPlaylist',
+        'expected_state': True
+    },
+    'remove': {
+        'operation_name': 'RemoveFromPlaylist',
+        'operation_id': '11403da1-d6fd-4cd7-9ad7-892554b70047',
+        'response_key': 'removeEntityFromPlaylist',
+        'expected_state': False
+    }
+}
+
+
 def logout():
     """Logout of the current account"""
     common.make_call('logout')
@@ -152,20 +168,26 @@ def update_remindme(operation, videoid, trackid):
 @measure_exec_time_decorator()
 def update_my_list(videoid, operation, params):
     """Call API to add / remove videos to my list"""
-    if params['trackid'] == 'None':
-        raise ErrorMsg('Unable update my list, trackid not found.')
+    mutation = MY_LIST_GRAPHQL_MUTATIONS.get(operation)
+    if not mutation:
+        raise APIError(f'Unsupported my list operation: {operation}')
+
     LOG.debug('My List: {} {}', operation, videoid)
+    variables = {'entityId': str(videoid.value)}
+    trackid = params.get('trackid')
+    if trackid and trackid != 'None':
+        variables['trackId'] = str(trackid)
+
     response = common.make_call(
-        'post_safe',
-        {'endpoint': 'playlistop',
-         'data': {
-             'lolomoId': 'unknown',
-             'operation': operation,
-             'videoId': int(videoid.value),
-             'trackId': int(params['trackid']),
-             'skipRootInvalidation': True,
-         }})
-    if response.get('status') != 'success':
+        'post_graphql',
+        {'operation_name': mutation['operation_name'],
+         'operation_id': mutation['operation_id'],
+         'variables': variables,
+         'referer': f'https://www.netflix.com/title/{videoid.value}'})
+    entity = (response.get('data', {})
+              .get(mutation['response_key'], {})
+              .get('entity', {}))
+    if entity.get('isInPlaylist') != mutation['expected_state']:
         LOG.debug('update_my_list response: {}', response)
         raise APIError('Unable update my list, an error occurred in the request.')
     _update_mylist_cache(videoid, operation, params)

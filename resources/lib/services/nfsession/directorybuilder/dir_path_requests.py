@@ -518,21 +518,17 @@ class DirectoryPathRequests:
         """Return the 'my list' video list as videoid items"""
         LOG.debug('Requesting "my list" video list as videoid items')
         try:
-            items = []
-            video_list = self.req_datatype_video_list_full(G.MAIN_MENU_ITEMS['myList']['request_context_name'])
+            video_list = self._browser_mylist_video_list()
             if video_list:
-                # pylint: disable=unused-variable
-                items = [common.VideoId.from_videolist_item(video)
-                         for video_id, video in video_list.videos.items()
-                         if video['queue']['value'].get('inQueue', False)]
-            return items
+                return [common.VideoId.from_videolist_item(video)
+                        for video in video_list.videos.values()]
         except InvalidVideoListTypeError:
             return []
         except req_exceptions.HTTPError as exc:
             if getattr(exc.response, 'status_code', None) != 404:
                 raise
             LOG.warn('My List marker lookup disabled because pathEvaluator returned 404')
-            return []
+        return []
 
     @cache_utils.cache_output(cache_utils.CACHE_COMMON, fixed_identifier='loco_list', ignore_self_class=True)
     def req_loco_list_root(self):
@@ -853,7 +849,14 @@ class DirectoryPathRequests:
         return [
             ['lists', list_id, ['componentSummary', 'debugRequest']],
             ['lists', list_id, 'page', 0, LOCO_PAGE_RANGE, 'itemSummary'],
-            ['lists', list_id, 'page', 0, LOCO_PAGE_RANGE, 'reference', LOCO_REFERENCE_FIELDS]
+            ['lists', list_id, 'page', 0, LOCO_PAGE_RANGE, 'reference', BROWSER_LOCO_REFERENCE_FIELDS]
+        ]
+
+    def _browser_video_list_full_paths(self, list_id):
+        return [
+            ['lists', list_id, ['componentSummary', 'debugRequest']],
+            ['lists', list_id, BROWSER_LOCO_DIRECT_RANGE, 'itemSummary'],
+            ['lists', list_id, BROWSER_LOCO_DIRECT_RANGE, 'reference', BROWSER_LOCO_REFERENCE_FIELDS]
         ]
 
     def _req_browser_lolomo_category(self, category_name):
@@ -876,6 +879,94 @@ class DirectoryPathRequests:
             self._browser_video_list_paths(str(list_id)),
             'https://www.netflix.com/browse')
         return VideoList(path_response, str(list_id))
+
+    def _browser_mylist_loco_response(self, root_id, auth_url, row_range):
+        return self._post_current_loco_paths([
+            ['locos', root_id, 'componentSummary'],
+            ['locos', root_id, row_range, 'componentSummary']
+        ], auth_url)
+
+    def _loco_row_key_for_list(self, root_response, root_id, list_id):
+        root_data = root_response.get('locos', {}).get(root_id, {})
+        for row_key, row_data in root_data.items():
+            if row_key == 'componentSummary' or not isinstance(row_data, dict):
+                continue
+            row_ref = row_data.get('value')
+            if isinstance(row_ref, list) and len(row_ref) > 1 and str(row_ref[1]) == str(list_id):
+                return int(row_key) if str(row_key).isdigit() else row_key
+        return None
+
+    def _browser_mylist_list_info(self, root_id, auth_url):
+        for row_range in (BROWSER_LOCO_HOME_VISIBLE_RANGE, BROWSER_LOCO_HOME_ROW_RANGE, LOCO_ROW_RANGE):
+            try:
+                root_response = self._browser_mylist_loco_response(root_id, auth_url, row_range)
+            except req_exceptions.HTTPError as exc:
+                if getattr(exc.response, 'status_code', None) not in (404, 412):
+                    raise
+                LOG.warn('My List queue lookup range {} returned {}; trying another range',
+                         row_range, exc.response.status_code)
+                continue
+            list_id, _video_list = LoCo(root_response).find_by_context('queue')
+            if list_id:
+                return str(list_id), self._loco_row_key_for_list(root_response, root_id, list_id)
+        raise InvalidVideoListTypeError('No current LoCo My List queue available')
+
+    def _browser_mylist_loco_row_paths(self, root_id, row_key, use_direct_range):
+        item_range = BROWSER_LOCO_DIRECT_RANGE if use_direct_range else LOCO_PAGE_RANGE
+        row_path = ['locos', root_id, row_key]
+        if use_direct_range:
+            return [
+                row_path + ['componentSummary'],
+                row_path + [item_range, 'itemSummary'],
+                row_path + [item_range, 'reference', BROWSER_LOCO_REFERENCE_FIELDS]
+            ]
+        return [
+            row_path + ['componentSummary'],
+            row_path + ['page', 0, item_range, 'itemSummary'],
+            row_path + ['page', 0, item_range, 'reference', BROWSER_LOCO_REFERENCE_FIELDS]
+        ]
+
+    def _browser_mylist_loco_video_list(self, root_id, row_key, list_id, auth_url):
+        for use_direct_range in (True, False):
+            try:
+                path_response = self._post_current_loco_paths(
+                    self._browser_mylist_loco_row_paths(root_id, row_key, use_direct_range), auth_url)
+                if str(list_id) in path_response.get('lists', {}):
+                    return VideoList(path_response, str(list_id))
+            except req_exceptions.HTTPError as exc:
+                if getattr(exc.response, 'status_code', None) not in (404, 412):
+                    raise
+                LOG.warn('My List LoCo row content request returned {}; trying fallback path',
+                         exc.response.status_code)
+        raise InvalidVideoListTypeError('No current LoCo My List content available')
+
+    def _browser_mylist_direct_video_list(self, list_id, auth_url):
+        for paths in (self._browser_video_list_full_paths(str(list_id)),
+                      self._browser_video_list_paths(str(list_id))):
+            try:
+                return VideoList(self._post_current_loco_paths(paths, auth_url), str(list_id))
+            except req_exceptions.HTTPError as exc:
+                if getattr(exc.response, 'status_code', None) not in (404, 412):
+                    raise
+                LOG.warn('My List direct list content request returned {}; trying fallback path',
+                         exc.response.status_code)
+        raise InvalidVideoListTypeError('No current direct My List content available')
+
+    def _browser_mylist_video_list(self):
+        root_id, auth_url = self._get_current_loco_root_id()
+        list_id, row_key = self._browser_mylist_list_info(root_id, auth_url)
+        if row_key is not None:
+            try:
+                video_list = self._browser_mylist_loco_video_list(root_id, row_key, list_id, auth_url)
+            except InvalidVideoListTypeError:
+                LOG.warn('Falling back to direct My List request after LoCo row content lookup failed')
+                video_list = self._browser_mylist_direct_video_list(list_id, auth_url)
+        else:
+            video_list = self._browser_mylist_direct_video_list(list_id, auth_url)
+        for video in video_list.videos.values():
+            video.setdefault('queue', _value({}))
+            video['queue'].setdefault('value', {})['inQueue'] = True
+        return video_list
 
     def _browser_lolomo_video_list_by_id(self, category_name, list_id):
         self._browse_html_and_auth_url()
@@ -960,6 +1051,26 @@ class DirectoryPathRequests:
                 return video_list
         return next(iter(loco.lists.values()))
 
+    def _first_full_browser_genre_video_list(self, genre_id):
+        loco = self._req_browser_genre_loco(genre_id)
+        first_list_id = None
+        first_video_list = None
+        for list_id, video_list in loco.lists.items():
+            if first_list_id is None:
+                first_list_id = list_id
+                first_video_list = video_list
+            if video_list.videos:
+                first_list_id = list_id
+                first_video_list = video_list
+                break
+        if first_list_id is None:
+            raise InvalidVideoListTypeError(f'No browser genre rows available for {genre_id}')
+        try:
+            return self._browser_genre_video_list_by_id(genre_id, first_list_id)
+        except Exception as exc:  # pylint: disable=broad-except
+            LOG.warn('Using materialized genre preview row after full row lookup failed: {}', exc)
+            return first_video_list
+
     def _req_current_loco_root_data(self):
         root_id, auth_url = self._get_current_loco_root_id()
         return self._post_current_loco_paths(self._current_loco_paths(root_id), auth_url)
@@ -1043,6 +1154,12 @@ class DirectoryPathRequests:
         # This type of request allows to obtain more than ~40 results
         LOG.debug('Requesting video list sorted for context name: "{}", context id: "{}"',
                   context_name, context_id)
+        if context_name == 'mylist':
+            try:
+                return self._browser_mylist_video_list()
+            except InvalidVideoListTypeError:
+                LOG.warn('Falling back to legacy sorted My List request after current queue lookup failed')
+
         base_path = [context_name]
         response_type = 'stdlist'
         if context_id:
@@ -1066,13 +1183,14 @@ class DirectoryPathRequests:
         try:
             path_response = self.nfsession.perpetual_path_request(paths, [response_type, base_path], perpetual_range_start)
         except req_exceptions.HTTPError as exc:
-            if getattr(exc.response, 'status_code', None) != 404:
+            status_code = getattr(exc.response, 'status_code', None)
+            if status_code not in (404, 412):
                 raise
             context = SORTED_LIST_CONTEXT_FALLBACKS.get((context_name, str(context_id)))
-            if not context:
+            if context_name != 'genres' and not context:
                 raise
-            LOG.warn('Falling back to browser-shaped genre {} after pathEvaluator 404', context_id)
-            return self._first_loco_video_list(self._req_browser_genre_loco(context_id))
+            LOG.warn('Falling back to browser-shaped genre {} after pathEvaluator {}', context_id, status_code)
+            return self._first_full_browser_genre_video_list(context_id)
         return VideoListSorted(path_response, context_name, context_id, req_sort_order_type)
 
 
@@ -1243,6 +1361,9 @@ class DirectoryPathRequests:
         contains only minimal video info
         """
         LOG.debug('Requesting the full video list for {}', context_name)
+        if context_name == 'mylist' and not switch_profiles:
+            return self._browser_mylist_video_list()
+
         paths = (build_paths([context_name, 'az', RANGE_PLACEHOLDER], VIDEO_LIST_BASIC_PARTIAL_PATHS) +
                  [[context_name, ['id', 'name', 'requestId', 'trackIds']]])
         call_args = {

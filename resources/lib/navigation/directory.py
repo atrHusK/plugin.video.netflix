@@ -182,7 +182,7 @@ class Directory:
             'menu_data': menu_data,
             'sub_genre_id': self.params.get('sub_genre_id'),  # Used to show the sub-genre folder when sub-genres exists
             'perpetual_range_start': self.perpetual_range_start,
-            'is_dynamic_id': not G.is_known_menu_context(pathitems[2])
+            'is_dynamic_id': len(pathitems) > 2 and not G.is_known_menu_context(pathitems[2])
         }
         dir_items, extra_data = common.make_call('get_video_list_sorted', call_args)
         sort_type = 'sort_nothing'
