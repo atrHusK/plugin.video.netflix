@@ -75,7 +75,7 @@ class AMVideoEvents(ActionManager):
         try:
             videoid_exists, list_id = self.directory_builder.get_continuewatching_videoid_exists(
                 str(self.videoid_parent.value))
-            if not videoid_exists:
+            if not videoid_exists and list_id:
                 # Delete the cache of continueWatching list
                 G.CACHE.delete(CACHE_COMMON, list_id, including_suffixes=True)
                 # When the continueWatching context is invalidated from a refreshListByContext call

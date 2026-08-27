@@ -10,6 +10,7 @@
 import time
 from datetime import datetime, timedelta
 
+import requests.exceptions as req_exceptions
 import xbmc
 
 import resources.lib.common as common
@@ -251,10 +252,89 @@ class NFSessionOperations(SessionPathRequests):
                          build_paths(['videos', int(videoid.tvshowid)], ART_PARTIAL_PATHS + [[['title', 'delivery']]]))
             else:
                 paths = build_paths(['videos', int(videoid.value)], VIDEO_LIST_PARTIAL_PATHS)
-            raw_data = self.path_request(paths)
+            try:
+                raw_data = self.path_request(paths)
+            except req_exceptions.HTTPError as exc:
+                LOG.warn('Video info pathEvaluator lookup failed: {}. Falling back to metadata endpoint.', exc)
+                raw_data = self._get_videoid_info_metadata(videoid)
             infos = get_info(videoid, raw_data['videos'][videoid.value], raw_data, profile_language_code)[0]
             art = get_art(videoid, raw_data['videos'][videoid.value], profile_language_code)
         return infos, art
+
+    def _get_videoid_info_metadata(self, videoid):
+        metadata_data = self.get_safe(
+            endpoint='metadata',
+            params={'movieid': videoid.value, '_': int(time.time() * 1000)})
+        video = metadata_data['video']
+        item = self._metadata_video_to_path_item(videoid, video)
+        videos = {videoid.value: item}
+        if videoid.mediatype == common.VideoId.EPISODE and videoid.tvshowid:
+            videos.setdefault(videoid.tvshowid, {
+                'title': {'value': video.get('seriesTitle') or video.get('showTitle') or ''},
+                'delivery': {'value': {}}
+            })
+        return {'videos': videos}
+
+    @staticmethod
+    def _metadata_video_to_path_item(videoid, video):
+        title = video.get('title') or str(videoid.value)
+        synopsis = video.get('synopsis') or video.get('regularSynopsis') or ''
+        image_url = NFSessionOperations._find_metadata_image_url(video)
+        item = {
+            'summary': {'value': {
+                'id': int(videoid.value),
+                'type': videoid.mediatype,
+                'name': title
+            }},
+            'title': {'value': title},
+            'synopsis': {'value': synopsis},
+            'regularSynopsis': {'value': synopsis},
+            'runtime': {'value': video.get('runtime') or 0},
+            'releaseYear': {'value': video.get('year') or video.get('releaseYear') or 0},
+            'delivery': {'value': video.get('delivery') or {}},
+            'availability': {'value': {'isPlayable': True}},
+            'queue': {'value': {'inQueue': False}},
+            'inRemindMeList': {'value': False},
+            'bookmarkPosition': {'value': (video.get('bookmark') or {}).get('offset', 0)},
+            'creditsOffset': {'value': video.get('creditsOffset') or 0},
+            'watchedToEndOffset': {'value': video.get('watchedToEndOffset') or 0},
+            'watched': {'value': bool((video.get('bookmark') or {}).get('watchedDate'))},
+            'trackIds': {'value': {}},
+            'requestId': {'value': ''}
+        }
+        if image_url:
+            art_value = {'url': image_url}
+            item['boxarts'] = {
+                '_342x192': {'jpg': {'value': art_value}},
+                '_1280x720': {'jpg': {'value': art_value}},
+                '_665x375': {'jpg': {'value': art_value}}
+            }
+            item['interestingMoment'] = {'_1280x720': {'jpg': {'value': art_value}}}
+            item['itemSummary'] = {'value': {'id': int(videoid.value), 'title': title, 'boxArt': {'url': image_url}}}
+        return item
+
+    @staticmethod
+    def _find_metadata_image_url(video):
+        for key in ('boxArt', 'boxart', 'artwork', 'interestingMoment', 'interestingMomentUrl'):
+            value = video.get(key)
+            if isinstance(value, str) and value.startswith('http'):
+                return value
+            if isinstance(value, dict):
+                url = NFSessionOperations._find_url_in_dict(value)
+                if url:
+                    return url
+        return ''
+
+    @staticmethod
+    def _find_url_in_dict(data):
+        for value in data.values():
+            if isinstance(value, str) and value.startswith('http'):
+                return value
+            if isinstance(value, dict):
+                url = NFSessionOperations._find_url_in_dict(value)
+                if url:
+                    return url
+        return ''
 
     def get_loco_data(self):
         """

@@ -46,7 +46,9 @@ LOCO_REFERENCE_FIELDS = [
     'maturity', 'releaseYear'
 ]
 LOCO_CATEGORY_CONTEXTS = {
-    'comingSoon': ('newThisWeek', 'popularTitles', 'mostWatched', 'trendingNow')
+    'comingSoon': ('newThisWeek', 'popularTitles', 'mostWatched', 'trendingNow'),
+    'recommendations': ('similars', 'becauseYouAdded', 'becauseYouLiked', 'watchAgain', 'bigRow',
+                        'topTen', 'trendingNow', 'popularTitles')
 }
 SORTED_LIST_CONTEXT_FALLBACKS = {
     ('genres', '1592210'): 'newThisWeek'
@@ -675,7 +677,6 @@ class DirectoryPathRequests:
             ])
         if include_genre_paths:
             paths.insert(0, root_path[:-1] + [['name', 'trackIds']])
-            paths.insert(4, root_path + ['subgenres', {'from': 0, 'to': 30}, BROWSER_GENRE_SUBGENRE_FIELDS])
         return paths
 
     def _browser_video_list_paths(self, list_id):
@@ -715,6 +716,15 @@ class DirectoryPathRequests:
             raise InvalidVideoListTypeError(f'No LoLoMo category list with id {list_id}')
         return VideoList(path_response, str(list_id))
 
+    def _browser_genre_video_list_by_id(self, genre_id, list_id):
+        self._browse_html_and_auth_url()
+        path_response = self._post_browser_path_evaluator(
+            self._browser_loco_paths(['genres', int(genre_id), 'rw'], include_genre_paths=True, include_full_rows=True),
+            f'https://www.netflix.com/browse/genre/{genre_id}')
+        if str(list_id) not in path_response.get('lists', {}):
+            raise InvalidVideoListTypeError(f'No genre list with id {list_id}')
+        return VideoList(path_response, str(list_id))
+
     def _first_loco_video_list(self, loco):
         for _list_id, video_list in loco.lists.items():
             if video_list.videos:
@@ -729,6 +739,11 @@ class DirectoryPathRequests:
         loco = LoCo(self._req_current_loco_root_data())
         list_id, video_list = loco.find_by_context(context)
         if not list_id:
+            category_contexts = LOCO_CATEGORY_CONTEXTS.get('comingSoon', ())
+            if context in category_contexts:
+                for _list_id, summary, category_video_list in self.req_lolomo_category('comingSoon').lists():
+                    if summary.get('context') == context:
+                        return category_video_list
             raise InvalidVideoListTypeError(f'No current LoCo list with context {context} available')
         return video_list
 
@@ -782,7 +797,7 @@ class DirectoryPathRequests:
             if getattr(exc.response, 'status_code', None) != 404:
                 raise
             initial_menu_id = (menu_data or {}).get('initial_menu_id')
-            if initial_menu_id == 'newAndPopular':
+            if initial_menu_id in ('newAndPopular', 'recommendations'):
                 LOG.warn('Falling back to browser-shaped LoLoMo category list {} after pathEvaluator 404', list_id)
                 return self._browser_lolomo_video_list_by_id('comingSoon', list_id)
             LOG.warn('Falling back to browser-shaped list {} after pathEvaluator 404', list_id)
@@ -871,19 +886,78 @@ class DirectoryPathRequests:
         path = build_paths(
             ['videos', videoid.value, supplemental_type, {"from": 0, "to": 35}], TRAILER_PARTIAL_PATHS
         )
-        try:
-            path_response = self.nfsession.path_request(path)
-        except req_exceptions.HTTPError as exc:
-            if getattr(exc.response, 'status_code', None) != 404:
-                raise
-            LOG.warn('Trailer supplemental path returned 404 for {}, returning empty trailer list', videoid)
+        def _empty_fallback():
             return SimpleNamespace(
                 perpetual_range_selector=None,
                 videos=OrderedDict(),
                 artitem=None,
                 contained_titles=[],
                 component_summary={})
-        return VideoListSupplemental(path_response, 'videos', videoid.value, supplemental_type)
+
+        def _similars_fallback():
+            try:
+                path_response = self.nfsession.path_request(
+                    [['videos', int(videoid.value), 'similars', {'from': 0, 'to': 35}, 'summary']])
+            except req_exceptions.HTTPError as exc:
+                if getattr(exc.response, 'status_code', None) != 404:
+                    raise
+                LOG.warn('Similar-title fallback returned 404 for {}', videoid)
+                return _empty_fallback()
+            similar_items = common.get_path_safe(['videos', videoid.value, 'similars'], path_response, None, {})
+            videos = OrderedDict()
+            if isinstance(similar_items, dict):
+                iterable_items = similar_items.values()
+            else:
+                iterable_items = similar_items if isinstance(similar_items, list) else []
+            for item in iterable_items:
+                summary = item.get('value') if isinstance(item, dict) else None
+                if not isinstance(summary, dict) or not summary.get('id'):
+                    continue
+                item_id = str(summary['id'])
+                title = summary.get('name') or summary.get('title') or item_id
+                videos[item_id] = {
+                    'title': _value(title),
+                    'summary': _value(summary),
+                    'availability': _value({'isPlayable': True}),
+                    'trackIds': _value({})
+                }
+                metadata_video = self._metadata_for_search_video(item_id)
+                if metadata_video:
+                    videos[item_id] = _merge_search_metadata_video(videos[item_id], metadata_video)
+            return CustomVideoList({'videos': videos}) if videos else _empty_fallback()
+
+        def _promo_fallback():
+            metadata = self.nfsession.get_safe(endpoint='metadata', params={'movieid': videoid.value, '_': int(time.time() * 1000)})
+            trailer_id = common.get_path_safe(['video', 'promoVideo', 'value', 'id'], metadata, None)
+            if not trailer_id:
+                trailer_id = common.get_path_safe(['video', 'merchedVideoId'], metadata, None)
+            if not trailer_id:
+                LOG.warn('No promo trailer id found for {}, trying similar-title fallback', videoid)
+                return _similars_fallback()
+            title = common.get_path_safe(['video', 'title'], metadata, 'Trailer')
+            return SimpleNamespace(
+                perpetual_range_selector=None,
+                videos=OrderedDict({str(trailer_id): {
+                    'title': {'value': title},
+                    'availability': {'value': {'isPlayable': True}},
+                    'summary': {'value': {'id': int(trailer_id), 'type': 'movie', 'name': title}},
+                    'trackIds': {'value': {'trackId': str(trailer_id)}}
+                }}),
+                artitem=None,
+                contained_titles=[title],
+                component_summary={})
+        try:
+            path_response = self.nfsession.path_request(path)
+            trailer_list = VideoListSupplemental(path_response, 'videos', videoid.value, supplemental_type)
+            if trailer_list.videos:
+                return trailer_list
+            LOG.warn('Trailer supplemental response was empty for {}, trying promoVideo fallback', videoid)
+            return _promo_fallback()
+        except req_exceptions.HTTPError as exc:
+            if getattr(exc.response, 'status_code', None) != 404:
+                raise
+            LOG.warn('Trailer supplemental path returned 404 for {}, trying promoVideo fallback', videoid)
+            return _promo_fallback()
 
     @cache_utils.cache_output(cache_utils.CACHE_COMMON, identify_from_kwarg_name='chunked_video_list',
                               ttl=900, ignore_self_class=True)
@@ -1004,7 +1078,7 @@ class DirectoryPathRequests:
         try:
             return self._req_browser_lolomo_category(category_name)
         except req_exceptions.HTTPError as exc:
-            if exc.response is None or exc.response.status_code != 404:
+            if exc.response is None or exc.response.status_code not in (404, 412):
                 raise
-            LOG.warn('Falling back to current LoCo rows for LoLoMo category after pathEvaluator 404')
+            LOG.warn('Falling back to current LoCo rows for LoLoMo category after pathEvaluator {}', exc.response.status_code)
             return self._current_lolomo_category(category_name)
