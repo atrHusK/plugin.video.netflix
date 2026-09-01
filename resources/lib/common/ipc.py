@@ -17,7 +17,7 @@ from resources.lib.globals import G
 from resources.lib.utils.logging import LOG, measure_exec_time_decorator
 from .misc_utils import run_threaded
 
-IPC_TIMEOUT_SECS = 20
+IPC_TIMEOUT_SECS = 40
 # The login can wait the user that gets the one-time code sent by Netflix
 IPC_TIMEOUT_SECS_LOGIN = 600
 # Reading the Netflix home page rows needs to download and parse the whole browse page
