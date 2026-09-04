@@ -43,7 +43,6 @@ class EventsHandler(threading.Thread):
         self.cache_data_events = {}
         self.banned_events_ids = []
         self._stop_requested = False
-        self.loco_data = None
 
     def run(self):
         """Monitor and process the event queue"""
@@ -66,36 +65,23 @@ class EventsHandler(threading.Thread):
 
     def _process_event_request(self, event_type, event_data, player_state):
         """Build and make the event post request"""
-        # if event_type == EVENT_START:
-        #     # We get at every new video playback a fresh LoCo data
-        #     self.loco_data = self.nfsession.get_loco_data()
-        url = event_data['manifest']['links']['events']['href']
-        from resources.lib.services.nfsession.msl.msl_request_builder import MSLRequestBuilder
-        request_data = MSLRequestBuilder.build_request_data(url,
-                                                            self._build_event_params(event_type,
-                                                                                     event_data,
-                                                                                     player_state,
-                                                                                     event_data['manifest'],
-                                                                                     self.loco_data))
-        # Request attempts can be made up to a maximum of 3 times per event
-        LOG.info('EVENT [{}] - Executing request', event_type)
-        endpoint_url = ENDPOINTS['events'] + create_req_params(f'events/{event_type}')
         try:
+            manifest = event_data['manifest']
+            url = manifest['links']['events']['href']
+            if not url:
+                raise ValueError('manifest events link is empty')
+            from resources.lib.services.nfsession.msl.msl_request_builder import MSLRequestBuilder
+            event_params = self._build_event_params(event_type, event_data, player_state, manifest)
+            request_data = MSLRequestBuilder.build_request_data(url, event_params)
+            # Request attempts can be made up to a maximum of 3 times per event
+            LOG.info('EVENT [{}] - Executing request (track context={}, ui context={})',
+                     event_type, bool(event_params['trackId']),
+                     'uiplaycontext' in event_params['sessionParams'])
+            endpoint_url = ENDPOINTS['events'] + create_req_params(f'events/{event_type}')
             response = self.chunked_request(endpoint_url, request_data, get_esn())
             # Malformed/wrong content in requests are ignored without returning any error in the response or exception
-            LOG.debug('EVENT [{}] - Request response: {}', event_type, response)
-            # if event_type == EVENT_STOP:
-            #     # 15/01/2023 update_loco_context looks like not more used on website when playback stop
-            #     if event_data['allow_request_update_loco']:
-            #         if 'list_context_name' in self.loco_data:
-            #             self.nfsession.update_loco_context(
-            #                 self.loco_data['root_id'],
-            #                 self.loco_data['list_context_name'],
-            #                 self.loco_data['list_id'],
-            #                 self.loco_data['list_index'])
-            #         else:
-            #             LOG.debug('EventsHandler: LoCo list not updated no list context data provided')
-            #     self.loco_data = None
+            LOG.debug('EVENT [{}] - Request completed (response type={})', event_type,
+                      type(response).__name__)
         except Exception as exc:  # pylint: disable=broad-except
             LOG.error('EVENT [{}] - The request has failed: {}', event_type, exc)
             # Ban future event requests from this event xid
@@ -127,7 +113,7 @@ class EventsHandler(threading.Thread):
         self.cache_data_events = {}
         self.banned_events_ids = []
 
-    def _build_event_params(self, event_type, event_data, player_state, manifest, loco_data):  # pylint: disable=unused-argument
+    def _build_event_params(self, event_type, event_data, player_state, manifest):
         """Build data params for an event request"""
         videoid_value = event_data['videoid'].value
         # Get previous elaborated data of the same video id
@@ -135,20 +121,7 @@ class EventsHandler(threading.Thread):
         previous_data, previous_player_state = self.cache_data_events.get(videoid_value, ({}, None))
         timestamp = int(time.time() * 1000)
 
-        # Context location values can be easily viewed from tag data-ui-tracking-context
-        # of a preview box in website html
-        # play_ctx_location = 'WATCHNOW'
-        play_ctx_location = 'MyListAsGallery' if event_data['is_in_mylist'] else 'browseTitles'
-
-        # To now it is not mandatory, we leave support for future changes
-        # if event_data['is_played_by_library']:
-        #     list_id = 'unknown'
-        # else:
-        #     list_id = G.LOCAL_DB.get_value('last_menu_id', 'unknown')
-
-        position = player_state['current_pts']
-        if position != 1:
-            position *= 1000
+        position = max(0, int(player_state['current_pts'] * 1000))
 
         if msl_utils.is_media_changed(previous_player_state, player_state):
             play_times, video_track_id, audio_track_id, sub_track_id = msl_utils.build_media_tag(player_state, manifest,
@@ -160,6 +133,19 @@ class EventsHandler(threading.Thread):
             audio_track_id = previous_data['audioTrackId']
             sub_track_id = previous_data['timedTextTrackId']
 
+        tracking_id = event_data.get('tracking_id')
+        if tracking_id in (None, 0, '0'):
+            tracking_id = ''
+        elif not isinstance(tracking_id, str):
+            tracking_id = str(tracking_id)
+
+        session_params = previous_data.get('sessionParams')
+        if session_params is None:
+            session_params = {'uiVersion': G.LOCAL_DB.get_value('ui_version', '', table=TABLE_SESSION)}
+            ui_play_context = event_data.get('ui_play_context')
+            if _is_complete_ui_play_context(ui_play_context, videoid_value):
+                session_params['uiplaycontext'] = dict(ui_play_context)
+
         params = {
             'event': event_type,
             'xid': previous_data.get('xid', G.LOCAL_DB.get_value('xid', table=TABLE_SESSION)),
@@ -169,32 +155,32 @@ class EventsHandler(threading.Thread):
             'videoTrackId': video_track_id,
             'audioTrackId': audio_track_id,
             'timedTextTrackId': sub_track_id,
-            'trackId': str(event_data['track_id']),
+            'trackId': tracking_id,
             'sessionId': str(self.session_id),
             'appId': str(self.app_id or self.session_id),
             'playTimes': play_times,
-            'sessionParams': previous_data.get('sessionParams', {
-                'isUIAutoPlay': False,  # Should be set equal to the manifest request
-                'supportsPreReleasePin': True,  # Should be set equal to the manifest request
-                'supportsWatermark': True,  # Should be set equal to the manifest request
-                'preferUnletterboxed': False,  # Should be set equal to the manifest request
-                'uiplaycontext': {
-                    # 'list_id': list_id,  # not mandatory
-                    # lolomo_id: use loco root id value
-                    'lolomo_id': 'unknown', # loco_data['root_id'],
-                    'location': play_ctx_location,
-                    'rank': 0,  # Perhaps this is a reference of cdn rank used in the manifest? (we use always 0)
-                    'request_id': event_data['request_id'],
-                    'row': 0,  # Purpose not known
-                    'track_id': event_data['track_id'],
-                    'video_id': videoid_value
-                },
-                'uiVersion': G.LOCAL_DB.get_value('ui_version', '', table=TABLE_SESSION)
-            })
+            'sessionParams': session_params
         }
+
+        # Cadmium omits these optional fields when playback state does not provide them.
+        for optional_key in ('mediaId', 'programId'):
+            if manifest.get(optional_key) is not None:
+                params[optional_key] = manifest[optional_key]
 
         if event_type == EVENT_ENGAGE:
             params['action'] = 'User_Interaction'
 
         self.cache_data_events[videoid_value] = (params, player_state)
         return params
+
+
+def _is_complete_ui_play_context(context, videoid_value):
+    """Return whether the context contains real UI values instead of synthetic placeholders."""
+    if not isinstance(context, dict):
+        return False
+    required_values = ('lolomo_id', 'location', 'request_id', 'track_id', 'video_id')
+    if any(context.get(key) in (None, '', 0, '0', 'unknown') for key in required_values):
+        return False
+    if str(context['video_id']) != str(videoid_value):
+        return False
+    return isinstance(context.get('rank'), int) and isinstance(context.get('row'), int)

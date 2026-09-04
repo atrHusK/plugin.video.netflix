@@ -8,15 +8,13 @@
     See LICENSES/MIT.md for more information.
 """
 from typing import TYPE_CHECKING
-import time
 
 from resources.lib import common
 from resources.lib.common.cache_utils import CACHE_BOOKMARKS, CACHE_COMMON, CACHE_MANIFESTS
 from resources.lib.common.exceptions import InvalidVideoListTypeError
-import requests.exceptions as req_exceptions
 from resources.lib.globals import G
-from resources.lib.services.nfsession.msl.msl_utils import EVENT_ENGAGE, EVENT_START, EVENT_STOP, EVENT_KEEP_ALIVE
-from resources.lib.utils.api_paths import build_paths, EVENT_PATHS
+from resources.lib.services.nfsession.msl.msl_utils import (EVENT_ENGAGE, EVENT_KEEP_ALIVE, EVENT_PAUSE,
+                                                            EVENT_RESUME, EVENT_START, EVENT_STOP)
 from resources.lib.utils.esn import get_esn
 from resources.lib.utils.logging import LOG
 from .action_manager import ActionManager
@@ -44,7 +42,6 @@ class AMVideoEvents(ActionManager):
         self.tick_elapsed = 0
         self.is_player_in_pause = False
         self.lock_events = False
-        self.allow_request_update_loco = False
 
     def __str__(self):
         return f'enabled={self.enabled}'
@@ -56,15 +53,8 @@ class AMVideoEvents(ActionManager):
             return
         if (not data['is_played_from_strm'] or
                 (data['is_played_from_strm'] and G.ADDON.getSettingBool('sync_watched_status_library'))):
-            try:
-                self.event_data = self._get_event_data(self.videoid)
-            except req_exceptions.HTTPError as exc:
-                if getattr(exc.response, 'status_code', None) != 404:
-                    raise
-                LOG.warn('AMVideoEvents: falling back to metadata endpoint because video event metadata path returned 404')
-                self.event_data = self._get_event_data_metadata(self.videoid)
+            self.event_data = self._get_event_data(data)
             self.event_data['videoid'] = self.videoid
-            self.event_data['is_played_by_library'] = data['is_played_from_strm']
         else:
             self.enabled = False
 
@@ -92,7 +82,6 @@ class AMVideoEvents(ActionManager):
             return
         if self.is_player_in_pause and (self.tick_elapsed - self.last_tick_count) >= 1800:
             # When the player is paused for more than 30 minutes we interrupt the sending of events (1800secs=30m)
-            self._send_event(EVENT_ENGAGE, self.event_data, player_state)
             self._send_event(EVENT_STOP, self.event_data, player_state)
             self.is_event_start_sent = False
             self.lock_events = True
@@ -101,9 +90,6 @@ class AMVideoEvents(ActionManager):
                 # We do not use _on_playback_started() to send EVENT_START, because the action managers
                 # AMStreamContinuity and AMPlayback may cause inconsistencies with the content of player_state data
 
-                # When the playback starts for the first time, for correctness should send current_pts value to 1
-                if self.tick_elapsed < 5 and self.event_data['resume_position'] is None:
-                    player_state['current_pts'] = 1
                 self._send_event(EVENT_START, self.event_data, player_state)
                 self.is_event_start_sent = True
                 self.tick_elapsed = 0
@@ -113,9 +99,6 @@ class AMVideoEvents(ActionManager):
                     self._send_event(EVENT_KEEP_ALIVE, self.event_data, player_state)
                     self._save_resume_time(player_state['current_pts'])
                     self.last_tick_count = self.tick_elapsed
-                    # Allow request of loco update (for continueWatching and bookmark) only after the first minute
-                    # it seems that most of the time if sent earlier returns error
-                    self.allow_request_update_loco = True
         self.tick_elapsed += 1  # One tick almost always represents one second
 
     def on_playback_pause(self, player_state):
@@ -125,12 +108,17 @@ class AMVideoEvents(ActionManager):
             return
         self._reset_tick_count()
         self.is_player_in_pause = True
-        self._send_event(EVENT_ENGAGE, self.event_data, player_state)
+        self._send_event(EVENT_PAUSE, self.event_data, player_state)
         self._save_resume_time(player_state['current_pts'])
 
     def on_playback_resume(self, player_state):
+        was_paused = self.is_player_in_pause
         self.is_player_in_pause = False
         self.lock_events = False
+        if player_state['nf_is_ads_stream'] or not was_paused or not self.is_event_start_sent:
+            return
+        self._reset_tick_count()
+        self._send_event(EVENT_RESUME, self.event_data, player_state)
 
     def on_playback_seek(self, player_state):
         if player_state['nf_is_ads_stream']:
@@ -141,7 +129,6 @@ class AMVideoEvents(ActionManager):
         self._reset_tick_count()
         self._send_event(EVENT_ENGAGE, self.event_data, player_state)
         self._save_resume_time(player_state['current_pts'])
-        self.allow_request_update_loco = True
 
     def on_playback_stopped(self, player_state):
         if player_state['nf_is_ads_stream']:
@@ -149,7 +136,6 @@ class AMVideoEvents(ActionManager):
         if not self.is_event_start_sent or self.lock_events:
             return
         self._reset_tick_count()
-        self._send_event(EVENT_ENGAGE, self.event_data, player_state)
         self._send_event(EVENT_STOP, self.event_data, player_state)
         # Update the resume here may not always work due to race conditions with GUI directory refresh and Stop event
         self._save_resume_time(player_state['current_pts'])
@@ -172,76 +158,40 @@ class AMVideoEvents(ActionManager):
         if not player_state:
             LOG.warn('AMVideoEvents: the event [{}] cannot be sent, missing player_state data', event_type)
             return
-        event_data['allow_request_update_loco'] = self.allow_request_update_loco
         self.msl_handler.events_handler_thread.add_event_to_queue(event_type,
-                                                                  event_data,
-                                                                  player_state)
+                                                                  dict(event_data),
+                                                                  dict(player_state))
 
-    def _get_event_data(self, videoid):
-        """Get data needed to send event requests to Netflix"""
-        is_episode = videoid.mediatype == common.VideoId.EPISODE
-        req_videoids = [videoid]
-        if is_episode:
-            # Get also the tvshow data
-            req_videoids.append(videoid.derive_parent(common.VideoId.SHOW))
-
-        raw_data = self._get_video_raw_data(req_videoids)
-        if not raw_data:
-            return {}
-        LOG.debug('Event data: {}', raw_data)
-        videoid_data = raw_data['videos'][videoid.value]
-
-        if is_episode:
-            # Get inQueue from tvshow data
-            is_in_mylist = raw_data['videos'][str(req_videoids[1].value)]['queue'].get('value', {}).get('inQueue', False)
-        else:
-            is_in_mylist = videoid_data['queue'].get('value', {}).get('inQueue', False)
-
-        bookmark_pos = videoid_data['bookmarkPosition']['value']
-        resume_position = bookmark_pos if bookmark_pos > -1 else None
-        event_data = {'resume_position': resume_position,
-                      'runtime': videoid_data['runtime']['value'],
-                      'request_id': videoid_data['requestId']['value'],
-                      'watched': videoid_data['watched']['value'],
-                      'is_in_mylist': is_in_mylist}
-        if videoid.mediatype == common.VideoId.EPISODE:
-            event_data['track_id'] = videoid_data['trackIds']['value']['trackId_jawEpisode']
-        else:
-            event_data['track_id'] = videoid_data['trackIds']['value']['trackId_jaw']
-        return event_data
-
-    def _get_event_data_metadata(self, videoid):
-        parent_id = videoid.tvshowid if videoid.mediatype == common.VideoId.EPISODE else videoid.value
-        metadata_data = self.nfsession.get_safe(
-            endpoint='metadata',
-            params={'movieid': parent_id, '_': int(time.time() * 1000)})
-        item = metadata_data.get('video', {})
-        if videoid.mediatype == common.VideoId.EPISODE:
-            for season in item.get('seasons', []):
-                for episode in season.get('episodes', []):
-                    if str(episode.get('id')) == videoid.value:
-                        item = episode
-                        break
-                else:
-                    continue
-                break
+    def _get_event_data(self, init_data):
+        """Build playback-event state without depending on obsolete Falcor tracking fields."""
+        metadata = init_data.get('metadata') or ()
+        item = metadata[0] if isinstance(metadata, (list, tuple)) and metadata else {}
+        item = item if isinstance(item, dict) else {}
         bookmark = item.get('bookmark') or {}
-        bookmark_position = bookmark.get('offset') or item.get('bookmarkPosition') or 0
-        return {
-            'resume_position': bookmark_position if bookmark_position and bookmark_position > -1 else None,
-            'runtime': item.get('runtime') or 0,
-            'request_id': item.get('requestId') or '',
-            'watched': bool(bookmark.get('watchedDate') or item.get('watched')),
-            'is_in_mylist': False,
-            'track_id': (item.get('trackIds') or {}).get('trackId_jawEpisode') or
-                        (item.get('trackIds') or {}).get('trackId_jaw') or 0
-        }
+        bookmark = bookmark if isinstance(bookmark, dict) else {}
+        bookmark_position = bookmark.get('offset')
+        if bookmark_position is None:
+            bookmark_position = item.get('bookmarkPosition')
+        if bookmark_position is None:
+            bookmark_position = init_data.get('resume_position')
+        try:
+            bookmark_position = float(bookmark_position)
+        except (TypeError, ValueError):
+            bookmark_position = 0
 
-    def _get_video_raw_data(self, videoids):
-        """Retrieve raw data for specified video id's"""
-        video_ids = [int(videoid.value) for videoid in videoids]
-        LOG.debug('Requesting video raw data for {}', video_ids)
-        return self.nfsession.path_request(build_paths(['videos', video_ids], EVENT_PATHS))
+        tracking_id = init_data.get('tracking_id')
+        if tracking_id in (None, 0, '0'):
+            tracking_id = ''
+        elif not isinstance(tracking_id, str):
+            tracking_id = str(tracking_id)
+
+        return {
+            'resume_position': bookmark_position if bookmark_position > 0 else None,
+            'runtime': item.get('runtime') or 0,
+            'watched': bool(bookmark.get('watchedDate') or item.get('watched')),
+            'tracking_id': tracking_id,
+            'ui_play_context': init_data.get('ui_play_context')
+        }
 
 
 def _get_manifest(videoid):

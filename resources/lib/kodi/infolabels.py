@@ -60,7 +60,7 @@ def get_info(videoid, item, raw_data, profile_language_code='', delayed_db_op=Fa
         updated = _refresh_missing_atomic_infos(infos, item, ('Trailer', 'Year')) or updated
         if videoid.mediatype == common.VideoId.EPISODE:
             updated = _refresh_episode_numbers(infos, item) or updated
-        updated = _refresh_missing_referenced_infos(infos, item, raw_data) or updated
+        updated = _refresh_missing_referenced_infos(infos, item, raw_data, videoid) or updated
         updated = _refresh_missing_profile_cast(infos, videoid, profile_language_code) or updated
         if updated:
             G.CACHE.add(CACHE_INFOLABELS, cache_identifier, {'infos': infos, 'quality_infos': quality_infos},
@@ -93,11 +93,11 @@ def _refresh_missing_plot(infos, item):
     return True
 
 
-def _refresh_missing_referenced_infos(infos, item, raw_data):
+def _refresh_missing_referenced_infos(infos, item, raw_data, videoid):
     if not item or not raw_data:
         return False
     updated = False
-    referenced_infos = _parse_referenced_infos(item, raw_data)
+    referenced_infos = _parse_referenced_infos(item, raw_data, videoid)
     for key, value in referenced_infos.items():
         if value and not infos.get(key):
             infos[key] = value
@@ -322,7 +322,7 @@ def parse_info(videoid, item, raw_data, common_data):
         infos['PlayCount'] = 1
 
     infos.update(_parse_atomic_infos(item))
-    infos.update(_parse_referenced_infos(item, raw_data))
+    infos.update(_parse_referenced_infos(item, raw_data, videoid))
     infos.update(_parse_tags(item))
 
     if videoid.mediatype == common.VideoId.EPISODE:
@@ -353,14 +353,29 @@ def _transform_value(target, value):
             else value)
 
 
-def _parse_referenced_infos(item, raw_data):
+def _parse_referenced_infos(item, raw_data, videoid=None):
     """Parse those infos into infolabels that need their references
     resolved within the raw data"""
-    return {target: [person['name']['value']
-                     for _, person
-                     in paths.resolve_refs(item.get(source, {}), raw_data)
-                     if person['name']['value']]
-            for target, source in paths.REFERENCE_MAPPINGS.items()}
+    infos = {target: [person['name']['value']
+                      for _, person
+                      in paths.resolve_refs(item.get(source, {}), raw_data)
+                      if person['name']['value']]
+             for target, source in paths.REFERENCE_MAPPINGS.items()}
+    if (videoid and videoid.mediatype in (common.VideoId.SEASON, common.VideoId.EPISODE)
+            and not infos.get('Cast')):
+        videos = raw_data.get('videos', {}) if isinstance(raw_data, dict) else {}
+        tvshow = videos.get(str(videoid.tvshowid)) if isinstance(videos, dict) else None
+        if not isinstance(tvshow, dict):
+            try:
+                tvshow = videos.get(int(videoid.tvshowid))
+            except (AttributeError, TypeError, ValueError):
+                tvshow = None
+        if isinstance(tvshow, dict):
+            infos['Cast'] = [person['name']['value']
+                             for _, person
+                             in paths.resolve_refs(tvshow.get('cast', {}), raw_data)
+                             if person['name']['value']]
+    return infos
 
 
 def _parse_tags(item):

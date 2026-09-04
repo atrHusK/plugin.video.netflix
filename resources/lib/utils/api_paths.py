@@ -85,10 +85,6 @@ TRAILER_PARTIAL_PATHS = [
       'bookmarkPosition', 'creditsOffset']]
 ] + ART_PARTIAL_PATHS
 
-EVENT_PATHS = [
-    [['requestId', 'title', 'runtime', 'queue', 'bookmarkPosition', 'watched', 'trackIds']]
-]
-
 VIDEO_LIST_RATING_THUMB_PATHS = [
     [['summary', 'title', 'userRating', 'trackIds']]
 ]

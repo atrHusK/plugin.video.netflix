@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import resources.lib.common as common
 from resources.lib.utils.data_types import merge_data_type, CustomVideoList
-from resources.lib.common.cache_utils import CACHE_COMMON
+from resources.lib.common.cache_utils import CACHE_ARTINFO, CACHE_COMMON
 from resources.lib.common.exceptions import CacheMiss, InvalidVideoListTypeError
 from resources.lib.common import VideoId
 from resources.lib.globals import G
@@ -22,7 +22,7 @@ from resources.lib.services.nfsession.directorybuilder.dir_builder_items \
             build_home_rows_listing)
 from resources.lib.services.nfsession.directorybuilder.dir_path_requests import (DirectoryPathRequests,
                                                                                  _has_reference_entries,
-                                                                                 _metadata_has_reference_names,
+                                                                                 _metadata_has_cast_names,
                                                                                  _metadata_image_url,
                                                                                  _metadata_year,
                                                                                  metadata_with_title_page_fallback,
@@ -93,13 +93,33 @@ class DirectoryBuilder(DirectoryPathRequests):
     def get_seasons(self, pathitems, tvshowid_dict, perpetual_range_start):
         tvshowid = VideoId.from_dict(tvshowid_dict)
         season_list = self.req_seasons(tvshowid, perpetual_range_start=perpetual_range_start)
+        self._enrich_parent_cast(season_list, tvshowid.tvshowid)
         return build_season_listing(season_list, tvshowid, pathitems)
 
     @measure_exec_time_decorator(is_immediate=True)
     def get_episodes(self, pathitems, seasonid_dict, perpetual_range_start):
         seasonid = VideoId.from_dict(seasonid_dict)
         episodes_list = self.req_episodes(seasonid, perpetual_range_start=perpetual_range_start)
+        self._enrich_parent_cast(episodes_list, seasonid.tvshowid)
         return build_episode_listing(episodes_list, seasonid, pathitems)
+
+    def _enrich_parent_cast(self, video_list, tvshow_id):
+        """Add the series cast once so season and episode items can inherit it."""
+        raw_data = getattr(video_list, 'data', None)
+        videos = raw_data.get('videos') if isinstance(raw_data, dict) else None
+        if not isinstance(videos, dict):
+            return
+        tvshow = videos.get(str(tvshow_id))
+        if not isinstance(tvshow, dict):
+            try:
+                tvshow = videos.get(int(tvshow_id))
+            except (TypeError, ValueError):
+                tvshow = None
+        if not isinstance(tvshow, dict) or _has_reference_entries(tvshow, 'cast'):
+            return
+        metadata = self.req_title_cast_metadata(tvshow_id)
+        if _metadata_has_cast_names(metadata):
+            normalize_metadata_references(raw_data, tvshow_id, metadata, tvshow)
 
     @measure_exec_time_decorator(is_immediate=True)
     def get_video_list(self, list_id, menu_data, is_dynamic_id):
@@ -110,7 +130,7 @@ class DirectoryBuilder(DirectoryPathRequests):
         cache_enriched_list = (
             (defer_title_details or (not is_dynamic_id and menu_id == 'chosenForYou'))
             and not menu_data.get('no_use_cache'))
-        enriched_cache_id = f'enriched_video_list_{list_id}'
+        enriched_cache_id = f'enriched_video_list_cast_v1_{list_id}'
         video_list = None
         if cache_enriched_list:
             try:
@@ -135,14 +155,17 @@ class DirectoryBuilder(DirectoryPathRequests):
                 # pylint: disable=unexpected-keyword-arg
                 video_list = self.req_video_list(
                     list_id, menu_data=menu_data, no_use_cache=menu_data.get('no_use_cache'))
-            if menu_id != 'continueWatching':
+            if menu_id == 'continueWatching':
+                self._enrich_video_list_art(
+                    video_list, include_refs=True, art_only=True)
+            else:
                 # New & Popular rows can contain dozens of titles. The browser
-                # response already supplies each title and contextual artwork,
-                # so block only on repairing genuinely missing posters instead
-                # of risking the 20-second directory timeout.
+                # response already supplies titles and contextual artwork. Keep
+                # slower detail enrichment deferred there, but attach cast with
+                # the bounded DetailModal batch before Kodi builds ListItems.
                 self._enrich_video_list_art(
                     video_list,
-                    include_refs=not defer_title_details,
+                    include_refs=True,
                     art_only=defer_title_details)
             if cache_enriched_list:
                 G.CACHE.add(CACHE_COMMON, enriched_cache_id, video_list)
@@ -186,14 +209,14 @@ class DirectoryBuilder(DirectoryPathRequests):
         for video in video_list.videos.values():
             if not isinstance(video, dict):
                 continue
-            needs_art = self._needs_metadata_boxart(video)
+            missing_item_art = self._needs_metadata_boxart(video)
             needs_refs = include_refs and not _has_reference_entries(video, 'cast')
             needs_year = (not art_only and
                           not common.get_path_safe(['releaseYear', 'value'], video))
             needs_synopsis = (not art_only and
                               not (common.get_path_safe(['synopsis', 'value'], video) or
                                    common.get_path_safe(['regularSynopsis', 'value'], video)))
-            if not needs_art and not needs_refs and not needs_year and not needs_synopsis:
+            if not missing_item_art and not needs_refs and not needs_year and not needs_synopsis:
                 continue
             try:
                 videoid = VideoId.from_videolist_item(video)
@@ -201,32 +224,43 @@ class DirectoryBuilder(DirectoryPathRequests):
                 continue
             if videoid.mediatype not in (VideoId.MOVIE, VideoId.SHOW):
                 continue
+            needs_art = missing_item_art and not self._has_cached_poster(videoid)
+            if not needs_art and not needs_refs and not needs_year and not needs_synopsis:
+                continue
             pending.append((videoid, video, needs_art, needs_refs, needs_year, needs_synopsis))
         if not pending:
             return video_list
 
-        try:
-            metadata_request = self._prepare_metadata_request()
-        except Exception as exc:  # pylint: disable=broad-except
-            LOG.debug('List metadata request setup failed ({})', type(exc).__name__)
-            metadata_request = None
+        cast_metadata_by_video = self.req_title_cast_metadata_batch(
+            item[0].value for item in pending if item[3])
+
+        metadata_request = None
+        if any(item[2] or item[4] or item[5] for item in pending):
+            try:
+                metadata_request = self._prepare_metadata_request()
+            except Exception as exc:  # pylint: disable=broad-except
+                LOG.debug('List metadata request setup failed ({})', type(exc).__name__)
 
         def _load_metadata(item):
-            videoid, _video, _needs_art, needs_refs, needs_year, needs_synopsis = item
+            videoid, _video, needs_art, needs_refs, needs_year, needs_synopsis = item
             try:
                 metadata = (self._metadata_for_video_from_request(videoid.value, metadata_request)
-                            if metadata_request else {})
+                            if metadata_request and (needs_art or needs_year or needs_synopsis) else {})
             except Exception as exc:  # pylint: disable=broad-except
                 LOG.debug('Metadata enrichment skipped for {}: {}', videoid, exc)
                 metadata = {}
+            cast_metadata = cast_metadata_by_video.get(str(videoid.value), {})
+            if needs_refs and _metadata_has_cast_names(cast_metadata):
+                metadata = dict(metadata)
+                metadata['actors'] = cast_metadata['actors']
             if (not art_only and
-                    ((needs_refs and not _metadata_has_reference_names(metadata)) or
+                    ((needs_refs and not _metadata_has_cast_names(metadata)) or
                      (needs_year and not _metadata_year(metadata)) or
                      (needs_synopsis and not self._metadata_synopsis(metadata)))):
                 metadata = metadata_with_title_page_fallback(videoid.value, metadata)
             return item, metadata
 
-        max_workers = min(6, len(pending))
+        max_workers = min(12 if art_only else 6, len(pending))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(_load_metadata, item) for item in pending]
             for future in as_completed(futures):
@@ -253,6 +287,15 @@ class DirectoryBuilder(DirectoryPathRequests):
     def _needs_metadata_boxart(video):
         poster = common.get_path_safe(['boxarts', ART_SIZE_POSTER, 'jpg', 'value', 'url'], video)
         return not poster
+
+    @staticmethod
+    def _has_cached_poster(videoid):
+        language_code = G.LOCAL_DB.get_profile_config('language', '')
+        try:
+            art = G.CACHE.get(CACHE_ARTINFO, f'{videoid.value}_{language_code}')
+        except CacheMiss:
+            return False
+        return isinstance(art, dict) and bool(art.get('poster'))
 
     @staticmethod
     def _apply_metadata_art(video, metadata):

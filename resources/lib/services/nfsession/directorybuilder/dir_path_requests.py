@@ -28,12 +28,13 @@ from resources.lib.utils.data_types import (VideoListSorted, SubgenreList, Seaso
                                             CustomVideoList, LoLoMoCategory, VideoListSupplemental,
                                             VideosList)
 from resources.lib.common.exceptions import (InvalidVideoListTypeError, InvalidVideoId, MetadataNotAvailable,
-                                             WebsiteParsingError, APIError)
+                                             WebsiteParsingError, APIError, CacheMiss)
 from resources.lib.database.db_utils import TABLE_SESSION
 from resources.lib.utils.api_paths import (VIDEO_LIST_PARTIAL_PATHS, RANGE_PLACEHOLDER, VIDEO_LIST_BASIC_PARTIAL_PATHS,
                                            SEASONS_PARTIAL_PATHS, EPISODES_PARTIAL_PATHS, ART_PARTIAL_PATHS,
                                            ART_SIZE_FHD, ART_SIZE_POSTER, TRAILER_PARTIAL_PATHS,
-                                           SUPPLEMENTAL_TYPE_TRAILERS, build_paths, PATH_REQUEST_SIZE_MAX)
+                                           SUPPLEMENTAL_TYPE_TRAILERS, build_paths, count_references,
+                                           PATH_REQUEST_SIZE_MAX)
 from resources.lib.common import cache_utils
 from resources.lib.globals import G
 from resources.lib.services.nfsession.session.endpoints import ENDPOINTS
@@ -111,6 +112,9 @@ BROWSER_MYLIST_FIELDS = [
 SEARCH_GRAPHQL_PAGE_SIZE = 48
 SEARCH_TITLE_PAGE_METADATA_LIMIT = SEARCH_GRAPHQL_PAGE_SIZE
 SEARCH_TITLE_PAGE_METADATA_WORKERS = 12
+DETAIL_CAST_CACHE_PREFIX = 'detail_cast_v1_'
+DETAIL_CAST_MAX_WORKERS = 12
+DETAIL_CAST_REQUEST_TIMEOUT = (2, 4)
 METADATA_REFERENCE_KEYS = {
     'cast': ('people', ('cast', 'actors', 'actor', 'starring', 'starringActors')),
     'directors': ('people', ('directors', 'director')),
@@ -146,7 +150,7 @@ def _has_reference_entries(item, source):
     refs = item.get(source, {}) if isinstance(item, dict) else {}
     if not isinstance(refs, dict):
         return False
-    return any(common.is_numeric(key) for key in refs)
+    return count_references(refs) > 0
 
 
 def _metadata_names_from_value(value):
@@ -207,6 +211,12 @@ def _metadata_has_reference_names(metadata):
     return False
 
 
+def _metadata_has_cast_names(metadata):
+    if not isinstance(metadata, dict):
+        return False
+    return bool(_metadata_names(metadata, METADATA_REFERENCE_KEYS['cast'][1]))
+
+
 def _metadata_has_trailer(metadata):
     return bool(_metadata_trailer_id(metadata) or _metadata_trailer_url(metadata))
 
@@ -259,7 +269,7 @@ def _metadata_from_title_page(video_id):
 def metadata_with_title_page_fallback(video_id, metadata_video=None):
     """Return metadata enriched with public title page JSON-LD fields."""
     metadata_video = dict(metadata_video or {})
-    if (_metadata_has_reference_names(metadata_video) and
+    if (_metadata_has_cast_names(metadata_video) and
             _metadata_has_trailer(metadata_video) and
             _metadata_year(metadata_video) and
             (metadata_video.get('synopsis') or metadata_video.get('regularSynopsis'))):
@@ -370,6 +380,45 @@ def _summary(video_id, title, video_type, number=None, length=None):
     if length is not None:
         data['length'] = length
     return _value(data)
+
+
+def _detail_modal_variables(video_id):
+    video_id = int(video_id)
+    return {
+        'artworkContext': {},
+        'checkLinearChannel': True,
+        'fetchPromoVideoOverride': False,
+        'hasPromoVideoOverride': False,
+        'isLiveEpisodic': False,
+        'opaqueImageFormat': 'WEBP',
+        'promoVideoId': 0,
+        'textEvidenceUiContext': 'ODP',
+        'transparentImageFormat': 'WEBP',
+        'unifiedEntityId': f'Video:{video_id}',
+        'videoId': video_id,
+        'videoMerchContext': 'BROWSE',
+        'videoMerchEnabled': False
+    }
+
+
+def _detail_modal_cast_names(graphql_data):
+    """Return Netflix's ordered cast names from a DetailModal data object."""
+    entities = graphql_data.get('unifiedEntities') if isinstance(graphql_data, dict) else None
+    entity = entities[0] if isinstance(entities, list) and entities else {}
+    cast = entity.get('cast') if isinstance(entity, dict) else None
+    edges = cast.get('edges') if isinstance(cast, dict) else None
+    names = []
+    seen = set()
+    for edge in edges if isinstance(edges, list) else []:
+        node = edge.get('node') if isinstance(edge, dict) else None
+        name = node.get('name') if isinstance(node, dict) else None
+        name = name.strip() if isinstance(name, str) else ''
+        normalized = name.lower()
+        if not name or normalized in seen:
+            continue
+        seen.add(normalized)
+        names.append(name)
+    return names
 
 
 def _graphql_headers():
@@ -1649,6 +1698,102 @@ class DirectoryPathRequests:
         response.raise_for_status()
         return response.json()['data']
 
+    @staticmethod
+    def _detail_cast_cache_identifier(video_id):
+        return f'{DETAIL_CAST_CACHE_PREFIX}{video_id}'
+
+    def _prepare_detail_cast_request(self):
+        """Snapshot request state before running cast requests in workers."""
+        self.nfsession.assert_logged_in()
+        request_headers = dict(self.nfsession.session.headers)
+        request_headers.update(_graphql_headers())
+        request_cookies = requests.cookies.merge_cookies(
+            requests.cookies.RequestsCookieJar(), self.nfsession.session.cookies)
+        return SimpleNamespace(
+            url=GRAPHQL_URL,
+            headers=request_headers,
+            cookies=request_cookies)
+
+    @staticmethod
+    def _detail_cast_from_request(video_id, request_data):
+        payload = {
+            'operationName': 'DetailModal',
+            'variables': _detail_modal_variables(video_id),
+            'extensions': {
+                'persistedQuery': {
+                    'id': GRAPHQL_OP_DETAIL_MODAL,
+                    'version': 102
+                }
+            }
+        }
+        response = requests.post(
+            request_data.url,
+            json=payload,
+            headers=request_data.headers,
+            cookies=request_data.cookies,
+            timeout=DETAIL_CAST_REQUEST_TIMEOUT)
+        response.raise_for_status()
+        decoded_response = response.json() if response.content else {}
+        if decoded_response.get('errors'):
+            raise ValueError('DetailModal returned GraphQL errors')
+        return _detail_modal_cast_names(decoded_response.get('data') or {})
+
+    def req_title_cast_metadata_batch(self, video_ids):
+        """Return cached/current Netflix cast metadata keyed by video id."""
+        metadata_by_video = {}
+        missing_video_ids = []
+        for video_id in dict.fromkeys(str(value) for value in video_ids if value is not None):
+            try:
+                cast_names = G.CACHE.get(
+                    cache_utils.CACHE_METADATA,
+                    self._detail_cast_cache_identifier(video_id))
+                metadata_by_video[video_id] = {
+                    'actors': cast_names if isinstance(cast_names, list) else []
+                }
+            except CacheMiss:
+                missing_video_ids.append(video_id)
+            except Exception as exc:  # pylint: disable=broad-except
+                LOG.debug('Detail cast cache read failed ({})', type(exc).__name__)
+                missing_video_ids.append(video_id)
+        if not missing_video_ids:
+            return metadata_by_video
+
+        try:
+            request_data = self._prepare_detail_cast_request()
+        except Exception as exc:  # pylint: disable=broad-except
+            LOG.debug('Detail cast request setup failed ({})', type(exc).__name__)
+            return metadata_by_video
+
+        max_workers = min(DETAIL_CAST_MAX_WORKERS, len(missing_video_ids))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_by_video_id = {
+                executor.submit(self._detail_cast_from_request, video_id, request_data): video_id
+                for video_id in missing_video_ids
+            }
+            for future in as_completed(future_by_video_id):
+                video_id = future_by_video_id[future]
+                try:
+                    cast_names = future.result()
+                except Exception as exc:  # pylint: disable=broad-except
+                    LOG.debug('Detail cast lookup failed for video {} ({})', video_id, type(exc).__name__)
+                    continue
+                metadata_by_video[video_id] = {'actors': cast_names}
+                try:
+                    G.CACHE.add(
+                    cache_utils.CACHE_METADATA,
+                    self._detail_cast_cache_identifier(video_id),
+                    cast_names,
+                    ttl=(None if cast_names else
+                         max(1, G.ADDON.getSettingInt('cache_ttl')) * 60),
+                    delayed_db_op=True)
+                except Exception as exc:  # pylint: disable=broad-except
+                    LOG.debug('Detail cast cache write failed ({})', type(exc).__name__)
+        return metadata_by_video
+
+    def req_title_cast_metadata(self, video_id):
+        """Return Netflix DetailModal cast in the existing metadata shape."""
+        return self.req_title_cast_metadata_batch([video_id]).get(str(video_id), {'actors': []})
+
     def _req_seasons_graphql(self, videoid):
         data = self._post_graphql(
             'PreviewModalEpisodeSelector',
@@ -2917,21 +3062,7 @@ class DirectoryPathRequests:
         video_id = int(videoid.value)
         detail_data = self._post_graphql(
             'DetailModal',
-            {
-                'artworkContext': {},
-                'checkLinearChannel': True,
-                'fetchPromoVideoOverride': False,
-                'hasPromoVideoOverride': False,
-                'isLiveEpisodic': False,
-                'opaqueImageFormat': 'WEBP',
-                'promoVideoId': 0,
-                'textEvidenceUiContext': 'ODP',
-                'transparentImageFormat': 'WEBP',
-                'unifiedEntityId': f'Video:{video_id}',
-                'videoId': video_id,
-                'videoMerchContext': 'BROWSE',
-                'videoMerchEnabled': False
-            },
+            _detail_modal_variables(video_id),
             GRAPHQL_OP_DETAIL_MODAL)
         entity = (detail_data.get('unifiedEntities') or [None])[0] or {}
         edges = common.get_path_safe(['supplementalVideosList', 'edges'], entity, False, [])
