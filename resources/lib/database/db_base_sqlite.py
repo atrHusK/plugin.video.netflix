@@ -45,9 +45,13 @@ def handle_connection(func):
             if not args[0].is_connected:
                 if is_not_thread_safe:
                     args[0].mutex.acquire()
+                # The connection is stored per-thread (see the 'conn' property):
+                # sharing a single sqlite connection between threads mixes up the
+                # per-connection transaction state and breaks cursor isolation.
                 args[0].conn = sql.connect(args[0].db_file_path,
                                            isolation_level=CONN_ISOLATION_LEVEL,
-                                           check_same_thread = is_not_thread_safe)
+                                           timeout=15,
+                                           check_same_thread=True)
                 args[0].is_connected = True
                 conn = args[0].conn
             return func(*args, **kwargs)
@@ -78,6 +82,19 @@ class SQLiteDatabase(db_base.BaseDatabase):
     @is_connected.setter
     def is_connected(self, val):
         self.local_storage.is_connected = val
+
+    @property
+    def conn(self):
+        # One connection per thread: 'is_connected' is already thread-local, but the
+        # connection object itself was shared, so every thread's first DB call
+        # replaced the connection other threads were still using and the explicit
+        # BEGIN/COMMIT of 'set_values' interleaved between threads
+        # ("cannot start a transaction within a transaction" / "cannot commit").
+        return getattr(self.local_storage, 'conn', None)
+
+    @conn.setter
+    def conn(self, val):
+        self.local_storage.conn = val
 
     def _initialize_connection(self):
         try:
@@ -251,8 +268,17 @@ class SQLiteDatabase(db_base.BaseDatabase):
                 records_values.append((key, value_str, value_str, key))
         cur = self.get_cursor()
         cur.execute("BEGIN TRANSACTION;")
-        self._executemany_non_query(query, records_values, cur)
-        cur.execute("COMMIT;")
+        try:
+            self._executemany_non_query(query, records_values, cur)
+            cur.execute("COMMIT;")
+        except Exception:
+            # Leave the connection out of transaction state, it is kept open
+            # and reused by the current thread
+            try:
+                cur.execute("ROLLBACK;")
+            except sql.Error:
+                pass
+            raise
 
     @handle_connection
     def delete_key(self, key, table=db_utils.TABLE_APP_CONF):
