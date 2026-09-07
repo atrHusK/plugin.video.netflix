@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import resources.lib.common as common
 from resources.lib.utils.data_types import merge_data_type, CustomVideoList
 from resources.lib.common.cache_utils import CACHE_ARTINFO, CACHE_COMMON
-from resources.lib.common.exceptions import CacheMiss, InvalidVideoListTypeError
+from resources.lib.common.exceptions import CacheMiss, InvalidPathError, InvalidVideoListTypeError
 from resources.lib.common import VideoId
 from resources.lib.globals import G
 from resources.lib.utils.api_paths import ART_SIZE_FHD, ART_SIZE_POSTER
@@ -410,6 +410,10 @@ class DirectoryBuilder(DirectoryPathRequests):
 
     @measure_exec_time_decorator(is_immediate=True)
     def get_genres(self, menu_data, genre_id, force_use_videolist_id):
+        if not menu_data:
+            # A client with a stale path can send None (e.g. widget of a menu that no longer exists)
+            raise InvalidPathError('The requested menu is no longer available. '
+                                   'If used by a widget/favourite/shortcut, remove and add it again.')
         if genre_id:
             # Load the LoCo list of the specified genre
             loco_list = self.req_loco_list_genre(genre_id)

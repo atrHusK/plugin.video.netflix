@@ -36,6 +36,20 @@ from resources.lib.utils.logging import LOG, measure_exec_time_decorator
 #  the indexes are: 0 the function name of this 'Directory' class, 1 the menu id, 2 an optional id
 
 
+def _get_menu_data(menu_id):
+    """Get the data of a menu, from the hardcoded menus or from the dynamic menus (stored in the DB)"""
+    menu_data = G.MAIN_MENU_ITEMS.get(menu_id)
+    if not menu_data:  # Dynamic menus
+        menu_data = G.LOCAL_DB.get_value(menu_id, table=TABLE_MENU_DATA, data_type=dict)
+    if not menu_data:
+        # Can happen with Kodi widgets/favourites/shortcuts saved with a previous add-on version that
+        # reference a menu that no longer exists, 'None' must not be sent to the service (TypeError)
+        from resources.lib.common.exceptions import InvalidPathError
+        raise InvalidPathError(f'The menu "{menu_id}" is no longer available. '
+                               'If used by a widget/favourite/shortcut, remove and add it again.')
+    return menu_data
+
+
 class Directory:
     """Directory listings"""
 
@@ -155,9 +169,7 @@ class Directory:
     @custom_viewmode(G.VIEW_SHOW)
     def video_list(self, pathitems):
         """Show a video list of a list ID"""
-        menu_data = G.MAIN_MENU_ITEMS.get(pathitems[1])
-        if not menu_data:  # Dynamic menus
-            menu_data = G.LOCAL_DB.get_value(pathitems[1], table=TABLE_MENU_DATA, data_type=dict)
+        menu_data = _get_menu_data(pathitems[1])
         list_id = pathitems[2] if len(pathitems) > 2 else pathitems[1]
         is_dynamic_id = len(pathitems) > 2 and not G.is_known_menu_context(list_id)
         call_args = {
@@ -176,9 +188,7 @@ class Directory:
     @custom_viewmode(G.VIEW_SHOW)
     def video_list_sorted(self, pathitems):
         """Show a video list sorted of a 'context' name"""
-        menu_data = G.MAIN_MENU_ITEMS.get(pathitems[1])
-        if not menu_data:  # Dynamic menus
-            menu_data = G.LOCAL_DB.get_value(pathitems[1], table=TABLE_MENU_DATA, data_type=dict)
+        menu_data = _get_menu_data(pathitems[1])
         call_args = {
             'pathitems': pathitems,
             'menu_data': menu_data,
@@ -246,7 +256,7 @@ class Directory:
     @custom_viewmode(G.VIEW_FOLDER)
     def category_list(self, pathitems):
         """Show a list of folders of a LoLoMo category"""
-        menu_data = G.MAIN_MENU_ITEMS.get(pathitems[1])
+        menu_data = _get_menu_data(pathitems[1])
         call_args = {
             'menu_data': menu_data
         }
@@ -261,7 +271,7 @@ class Directory:
     @custom_viewmode(G.VIEW_FOLDER)
     def recommendations(self, pathitems):
         """Show video lists for a genre"""
-        menu_data = G.MAIN_MENU_ITEMS.get(pathitems[1])
+        menu_data = _get_menu_data(pathitems[1])
         call_args = {
             'menu_data': menu_data,
             'genre_id': None,
@@ -335,9 +345,7 @@ class Directory:
     @custom_viewmode(G.VIEW_FOLDER)
     def genres(self, pathitems):
         """Show loco list of a genre or from loco root the list of contexts specified in the menu data"""
-        menu_data = G.MAIN_MENU_ITEMS.get(pathitems[1])
-        if not menu_data:  # Dynamic menus
-            menu_data = G.LOCAL_DB.get_value(pathitems[1], table=TABLE_MENU_DATA, data_type=dict)
+        menu_data = _get_menu_data(pathitems[1])
         call_args = {
             'menu_data': menu_data,
             # When genre_id is None is loaded the loco root the list of contexts specified in the menu data
@@ -384,7 +392,7 @@ class Directory:
     @custom_viewmode(G.VIEW_FOLDER)
     def subgenres(self, pathitems):
         """Show a lists of sub-genres of a 'genre id'"""
-        menu_data = G.MAIN_MENU_ITEMS[pathitems[1]]
+        menu_data = _get_menu_data(pathitems[1])
         call_args = {
             'menu_data': menu_data,
             'genre_id': pathitems[2]
