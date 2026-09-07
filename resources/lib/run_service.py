@@ -75,7 +75,10 @@ class NetflixService:
         self.nf_server_instance.shutdown()
         self.nf_server_instance.server_close()
         self.nf_server_instance = None
-        self.nf_server_thread.join()
+        # Bounded join: Kodi kills the Python invoker after 5 seconds anyway
+        self.nf_server_thread.join(timeout=3)
+        if self.nf_server_thread.is_alive():
+            LOG.warn('[NF_SERVER] Thread still alive after shutdown join timeout')
         self.nf_server_thread = None
         LOG.info('Stopped MSL Service')
 

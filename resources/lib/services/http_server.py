@@ -62,6 +62,12 @@ class NetflixHttpRequestHandler(BaseHTTPRequestHandler):
 
 class NFThreadedTCPServer(ThreadingMixIn, TCPServer):
     """Handle each request in a separate thread"""
+    # Do not block the add-on service shutdown on in-flight request threads (e.g. a slow
+    # Netflix request), otherwise Kodi kills the service after 5 seconds ('script didn't
+    # stop in 5 seconds'), which can interrupt a database write halfway
+    daemon_threads = True
+    block_on_close = False
+
     def __init__(self, server_address):
         ThreadingMixIn.__init__(self)
         TCPServer.__init__(self, server_address, NetflixHttpRequestHandler)
