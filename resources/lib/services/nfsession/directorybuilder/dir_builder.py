@@ -344,8 +344,19 @@ class DirectoryBuilder(DirectoryPathRequests):
     def _video_list_from_lolomo_category_context(self, category_name, contexts, fallback_first=False):
         if isinstance(contexts, str):
             contexts = (contexts,)
+        try:
+            return self._lolomo_category_context_video_list(category_name, contexts, fallback_first)
+        except InvalidVideoListTypeError:
+            # The cached category response can hold expired session-scoped list ids (NES_..._p_<timestamp>)
+            # that a fresh 'by id' request no longer knows, refresh the category data and retry once
+            LOG.warn('LoLoMo category "{}" list resolution failed, retrying with fresh category data',
+                     category_name)
+            G.CACHE.delete(CACHE_COMMON, f'lolomo_category_{category_name}')
+            return self._lolomo_category_context_video_list(category_name, contexts, fallback_first)
+
+    def _lolomo_category_context_video_list(self, category_name, contexts, fallback_first):
         first_list_id = None
-        for list_id, summary, video_list in self.req_lolomo_category(category_name).lists():
+        for list_id, summary, video_list in self.req_lolomo_category(category_name=category_name).lists():
             if not first_list_id and video_list.videos:
                 first_list_id = list_id
             if summary.get('context') in contexts:
@@ -382,7 +393,7 @@ class DirectoryBuilder(DirectoryPathRequests):
 
     @measure_exec_time_decorator(is_immediate=True)
     def get_category_list(self, menu_data):
-        lolomo_category_list = self.req_lolomo_category(menu_data['loco_contexts'][0])
+        lolomo_category_list = self.req_lolomo_category(category_name=menu_data['loco_contexts'][0])
         return build_lolomo_category_listing(lolomo_category_list, menu_data)
 
     @measure_exec_time_decorator(is_immediate=True)
@@ -422,7 +433,7 @@ class DirectoryBuilder(DirectoryPathRequests):
                 menu_data['loco_contexts'] = None
                 force_use_videolist_id = True
         elif menu_data['path'][1] == 'recommendations':
-            return build_lolomo_category_listing(self.req_lolomo_category('comingSoon'), menu_data)
+            return build_lolomo_category_listing(self.req_lolomo_category(category_name='comingSoon'), menu_data)
         else:
             # Load the LoCo root list filtered by 'loco_contexts' specified in the menu_data
             loco_list = self.req_loco_list_root()

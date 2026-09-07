@@ -2713,7 +2713,8 @@ class DirectoryPathRequests:
         if not list_id:
             category_contexts = LOCO_CATEGORY_CONTEXTS.get('comingSoon', ())
             if context in category_contexts:
-                for _list_id, summary, category_video_list in self.req_lolomo_category('comingSoon').lists():
+                for _list_id, summary, category_video_list in self.req_lolomo_category(
+                        category_name='comingSoon').lists():
                     if summary.get('context') == context:
                         return category_video_list
             raise InvalidVideoListTypeError(f'No current LoCo list with context {context} available')
