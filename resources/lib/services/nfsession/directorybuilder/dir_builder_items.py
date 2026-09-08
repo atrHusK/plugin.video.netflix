@@ -19,7 +19,7 @@ from resources.lib.kodi.infolabels import get_color_name, set_watched_status, ad
 from resources.lib.services.nfsession.directorybuilder.dir_builder_utils import (get_param_watched_status_by_profile,
                                                                                  add_items_previous_next_page,
                                                                                  get_availability_message)
-from resources.lib.utils.logging import measure_exec_time_decorator
+from resources.lib.utils.logging import LOG, measure_exec_time_decorator
 
 
 # This module convert a DataType object like VideoListSorted (that contains a list of items videos, items, etc)
@@ -39,6 +39,16 @@ def get_common_data():
     }
 
 
+def _is_menu_visible(menu_id):
+    try:
+        return G.ADDON.getSettingBool('_'.join(('show_menu', menu_id)))
+    except TypeError:
+        # The 'show_menu_<id>' setting is missing in settings.xml (menu added/renamed by an update),
+        # 'Invalid setting type' error, default to visible instead of breaking the whole main menu
+        LOG.error('Missing "show_menu_{}" setting in settings.xml, the menu will be shown', menu_id)
+        return True
+
+
 @measure_exec_time_decorator(is_immediate=True)
 def build_mainmenu_listing(loco_list):
     """Builds the main menu listing (my list, continue watching, etc.)"""
@@ -46,7 +56,7 @@ def build_mainmenu_listing(loco_list):
     directory_items = []
     common_data = get_common_data()
     for menu_id, data in G.MAIN_MENU_ITEMS.items():
-        if data.get('has_show_setting', True) and not G.ADDON.getSettingBool('_'.join(('show_menu', menu_id))):
+        if data.get('has_show_setting', True) and not _is_menu_visible(menu_id):
             continue
         if data['loco_known']:
             list_id, video_list = loco_list.find_by_context(data['loco_contexts'][0])

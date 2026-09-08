@@ -81,7 +81,11 @@ class SettingsMonitor(xbmc.Monitor):
         for menu_id, menu_data in G.MAIN_MENU_ITEMS.items():
             # Check settings changes in show/hide menu
             if menu_data.get('has_show_setting', True):
-                show_menu_new_setting = bool(G.ADDON.getSettingBool('_'.join(('show_menu', menu_id))))
+                try:
+                    show_menu_new_setting = bool(G.ADDON.getSettingBool('_'.join(('show_menu', menu_id))))
+                except TypeError:
+                    # The 'show_menu_<id>' setting is missing in settings.xml ('Invalid setting type')
+                    show_menu_new_setting = True
                 show_menu_old_setting = G.LOCAL_DB.get_value(f'menu_{menu_id}_show',
                                                              True,
                                                              TABLE_SETTINGS_MONITOR)
