@@ -54,7 +54,7 @@ GRAPHQL_OP_PROFILES_SUMMARY = '2d907549-08ae-495b-a2c8-6777d38e9e0f'
 GRAPHQL_OP_DETAIL_MODAL = '7daad060-5725-4a2b-9d72-ffcfdc1b8760'
 GRAPHQL_OP_DETAIL_MODAL_TRAILERS = '06e30ee5-7983-4fef-8135-5914124b76ad'
 GRAPHQL_OP_DETAIL_MODAL_SIMILARS = '838718e1-85d7-41e6-b637-6a74dfda11d1'
-TOP_PICKS_SECTION_LABEL = 'top picks'
+TOP_PICKS_SECTION_LABELS = ('top picks', "we think you'll love these")
 NETFLIX_TITLE_URL = 'https://www.netflix.com/title/{}'
 TITLE_PAGE_GRAPHQL_RE = re.compile(r"netflix\.reactContext\.models\.graphql\s*=\s*JSON\.parse\('(.*?)'\);", re.DOTALL)
 TITLE_PAGE_JSONLD_RE = re.compile(
@@ -2549,14 +2549,12 @@ class DirectoryPathRequests:
 
     @staticmethod
     def _top_picks_graphql_section(graphql_data):
-        labels = {
-            TOP_PICKS_SECTION_LABEL,
-            str(common.get_local_string(30169) or '').casefold()
-        }
+        labels = set(TOP_PICKS_SECTION_LABELS)
+        labels.add(str(common.get_local_string(30169) or '').casefold().replace('\u2019', "'"))
         for section in graphql_data.values():
             if not isinstance(section, dict) or section.get('__typename') != 'PinotCarouselSection':
                 continue
-            label = str(section.get('displayString') or '').casefold()
+            label = str(section.get('displayString') or '').casefold().replace('\u2019', "'")
             if not any(candidate and candidate in label for candidate in labels):
                 continue
             connection = _graphql_ref_node(graphql_data, section.get('entities'))

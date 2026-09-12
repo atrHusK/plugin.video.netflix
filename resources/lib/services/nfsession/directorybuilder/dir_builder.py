@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import resources.lib.common as common
 from resources.lib.utils.data_types import merge_data_type, CustomVideoList
-from resources.lib.common.cache_utils import CACHE_ARTINFO, CACHE_COMMON
+from resources.lib.common.cache_utils import CACHE_COMMON
 from resources.lib.common.exceptions import CacheMiss, InvalidPathError, InvalidVideoListTypeError
 from resources.lib.common import VideoId
 from resources.lib.globals import G
@@ -209,23 +209,20 @@ class DirectoryBuilder(DirectoryPathRequests):
         for video in video_list.videos.values():
             if not isinstance(video, dict):
                 continue
-            missing_item_art = self._needs_metadata_boxart(video)
+            needs_art = self._needs_metadata_boxart(video)
             needs_refs = include_refs and not _has_reference_entries(video, 'cast')
             needs_year = (not art_only and
                           not common.get_path_safe(['releaseYear', 'value'], video))
             needs_synopsis = (not art_only and
                               not (common.get_path_safe(['synopsis', 'value'], video) or
                                    common.get_path_safe(['regularSynopsis', 'value'], video)))
-            if not missing_item_art and not needs_refs and not needs_year and not needs_synopsis:
+            if not needs_art and not needs_refs and not needs_year and not needs_synopsis:
                 continue
             try:
                 videoid = VideoId.from_videolist_item(video)
             except Exception:  # pylint: disable=broad-except
                 continue
             if videoid.mediatype not in (VideoId.MOVIE, VideoId.SHOW):
-                continue
-            needs_art = missing_item_art and not self._has_cached_poster(videoid)
-            if not needs_art and not needs_refs and not needs_year and not needs_synopsis:
                 continue
             pending.append((videoid, video, needs_art, needs_refs, needs_year, needs_synopsis))
         if not pending:
@@ -286,16 +283,12 @@ class DirectoryBuilder(DirectoryPathRequests):
     @staticmethod
     def _needs_metadata_boxart(video):
         poster = common.get_path_safe(['boxarts', ART_SIZE_POSTER, 'jpg', 'value', 'url'], video)
-        return not poster
-
-    @staticmethod
-    def _has_cached_poster(videoid):
-        language_code = G.LOCAL_DB.get_profile_config('language', '')
-        try:
-            art = G.CACHE.get(CACHE_ARTINFO, f'{videoid.value}_{language_code}')
-        except CacheMiss:
-            return False
-        return isinstance(art, dict) and bool(art.get('poster'))
+        browser_boxart = common.get_path_safe(
+            ['itemSummary', 'value', 'boxArt', 'url'], video)
+        # Netflix browser rows can label a landscape carousel image as boxArt,
+        # including dimensions that claim it is portrait. Only metadata boxart
+        # is reliable enough to use as a Kodi poster.
+        return not poster or poster == browser_boxart
 
     @staticmethod
     def _apply_metadata_art(video, metadata):
