@@ -87,8 +87,13 @@ def extract_session_data(content, validate=False, update_profiles=False):
         parse_profiles(falcor_cache)
     # Save only some info of the current profile from user data
     G.LOCAL_DB.set_value('build_identifier', user_data.get('BUILD_IDENTIFIER'), TABLE_SESSION)
-    if not get_website_esn():
+    # The website ESN depends on the user agent, e.g. it change when the Widevine CDM switch from Chrome OS to Linux
+    user_agent = common.get_user_agent()
+    if not get_website_esn() or G.LOCAL_DB.get_value('website_esn_ua', '', TABLE_SESSION) != user_agent:
+        if get_website_esn() and G.LOCAL_DB.get_value('esn_auto_generate', True):
+            G.LOCAL_DB.set_value('esn', '', TABLE_SESSION)  # Force a new ESN based on the new website ESN
         set_website_esn(user_data['esn'])
+        G.LOCAL_DB.set_value('website_esn_ua', user_agent, TABLE_SESSION)
     pref_locale = user_data.get('preferredLocale', {}).get('id')
     if pref_locale:
         G.LOCAL_DB.set_value('locale_id', pref_locale)
