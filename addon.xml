@@ -87,32 +87,34 @@
         <source>https://github.com/CastagnaIT/plugin.video.netflix</source>
         <news>v2.0.6b+atrHusK (2026-09-12)
 - Rebased on @Lekma master which contains the following fixes compared to CastagnaIT/master since go-vegan patch 8
-  - @go-vegan patch9 to 19:
-    - year information
-    - ignored resume position fix
-    - Various cast related fixes
-    - Various search related fixes
-    - Various thumbnail related fixes
-    - Add to My list @twprh
-    - Empty 'My list', 'All TV Shows', 'All Movies'
-    - 'Continue watching' showing only 8 titles
-    - Various 'New on Netflix' fixes
-    - Various 'Top picks' fixes
-    - Netflix trailers not always found, fallback to promo
-    - Compatibility with python 3.8 @Publish3r
-    - UTF in 'Continue watching' @jankofron
-    - Episode numbering @jankofron
-    - Experimental fix: Disabled password verification (access.py)
-  - @Breezyslasher fixes 18-26
-    - Support OTP for login
-    - Various api related changes and fixes
-  - @jesubiag
-    - SQLite related fixes
-    - Various kodi related fixes
-  - @atrHusK
+    - @go-vegan patch9 to 19:
+        - year information
+        - ignored resume position fix
+        - Various cast related fixes
+        - Various search related fixes
+        - Various thumbnail related fixes
+        - Add to My list @twprh
+        - Empty 'My list', 'All TV Shows', 'All Movies'
+        - 'Continue watching' showing only 8 titles
+        - Various 'New on Netflix' fixes
+        - Various 'Top picks' fixes
+        - Netflix trailers not always found, fallback to promo
+        - Compatibility with python 3.8 @Publish3r
+        - UTF in 'Continue watching' @jankofron
+        - Episode numbering @jankofron
+        - Experimental fix: Disabled password verification (access.py)
+    - @Breezyslasher fixes 18-26
+        - Support OTP for login
+        - Various api related changes and fixes
+    - @jesubiag
+        - SQLite related fixes
+        - Various kodi related fixes
+- @atrHusK
     - Dutch language file updates
     - Forwarded Build and release related changes
     - Forwarded a various minor corrections (plumbing)
+- @mostman
+    - Experimental fix for new Widevine installations on inputstreamhelper >= 0.8.6
         </news>
     </extension>
 </addon>
