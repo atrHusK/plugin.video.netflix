@@ -1,6 +1,6 @@
 v2.0.6b
-- Rebased on Lekma's master which contains the following fixes compared to CastagnaIT/master since go-vegan patch 8
-  - go-vegan patch9 to 19:
+- Rebased on @Lekma master which contains the following fixes compared to CastagnaIT/master since go-vegan patch 8
+  - @go-vegan patch9 to 19:
     - year information
     - ignored resume position fix
     - Various cast related fixes
@@ -16,16 +16,16 @@ v2.0.6b
     - UTF in 'Continue watching' @jankofron
     - Episode numbering @jankofron
     - Experimental fix: Disabled password verification (access.py)
-  - Breezyslasher fixes 18-26
+  - @Breezyslasher fixes 18-26
     - Support OTP for login
     - Various api related changes and fixes
-  - jesubiag
+  - @jesubiag
     - SQLite related fixes
     - Various kodi related fixes
-  - atrHusK
+  - @atrHusK
     - Dutch language file updates
     - Forwarded Build and release related changes
-    - Forwarded a various minor corrections (plumbing) 
+    - Forwarded a various minor corrections (plumbing)
 
 v1.24.1 (2026-06-29)
 - Should fix playback issues than can sometimes occur, like not starting at all or sound-only playback (jankofron)  

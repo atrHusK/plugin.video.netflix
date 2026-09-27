@@ -86,8 +86,8 @@
         <forum>https://forum.kodi.tv/showthread.php?tid=329767</forum>
         <source>https://github.com/CastagnaIT/plugin.video.netflix</source>
         <news>v2.0.6b+atrHusK (2026-09-12)
-- Rebased on Lekma's master which contains the following fixes compared to CastagnaIT/master since go-vegan patch 8
-  - go-vegan patch9 to 19:
+- Rebased on @Lekma master which contains the following fixes compared to CastagnaIT/master since go-vegan patch 8
+  - @go-vegan patch9 to 19:
     - year information
     - ignored resume position fix
     - Various cast related fixes
@@ -103,13 +103,13 @@
     - UTF in 'Continue watching' @jankofron
     - Episode numbering @jankofron
     - Experimental fix: Disabled password verification (access.py)
-  - Breezyslasher fixes 18-26
+  - @Breezyslasher fixes 18-26
     - Support OTP for login
     - Various api related changes and fixes
-  - jesubiag
+  - @jesubiag
     - SQLite related fixes
     - Various kodi related fixes
-  - atrHusK
+  - @atrHusK
     - Dutch language file updates
     - Forwarded Build and release related changes
     - Forwarded a various minor corrections (plumbing)
