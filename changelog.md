@@ -25,18 +25,18 @@ v2.0.6b
   - atrHusK
     - Dutch language file updates
     - Forwarded Build and release related changes
-    - Forwarded a few minor corrections that fix nothing
+    - Forwarded a various minor corrections (plumbing) 
 
 v1.24.1 (2026-06-29)
-- Should fix playback issues than can sometimes occur, like not starting at all or sound-only playback (jankofron)
+- Should fix playback issues than can sometimes occur, like not starting at all or sound-only playback (jankofron)  
   See https://github.com/CastagnaIT/plugin.video.netflix/pull/1791
-- Should fix 'Website parsing error: unable to extract reactContext' (biocoder-frodo)
+- Should fix 'Website parsing error: unable to extract reactContext' (biocoder-frodo)  
   See https://github.com/CastagnaIT/plugin.video.netflix/pull/1727
-- Fixes 'Profile switching' to profiles without pin (Krumbthi)
+- Fixes 'Profile switching' to profiles without pin (Krumbthi)  
   See https://github.com/CastagnaIT/plugin.video.netflix/pull/1783
-- Fixes plugin no longer functional due to even more API changes by Netflix (go-vegan)
-  Biggest part of the fixes, lots of thanks to go-vegan \o/
-  Using patch 8, see https://github.com/CastagnaIT/plugin.video.netflix/issues/1792
+- Fixes plugin no longer functional due to even more API changes by Netflix (go-vegan)  
+  Biggest part of the fixes, lots of thanks to go-vegan \o/  
+  Using patch 8, see https://github.com/CastagnaIT/plugin.video.netflix/issues/1792  
   NB. That patch also contains the work from the others mentioned above.
 - Fixed profile switching to a pin locked profile (AtrHusK)
 - Fixed 'My List' (Ruud68)
