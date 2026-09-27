@@ -376,10 +376,10 @@ class SessionAccess(SessionCookie, SessionHTTPRequests):
     def flush_mfa_feedback(self):
         """Send the feedback that closes the identity check, the website sends it last"""
         pending = getattr(self, '_pending_mfa_feedback', None)
-        if not isinstance(pending, Iterable):
+        if not pending:
             return
         self._pending_mfa_feedback = None
-        self._clcs_send_effect_feedback(*pending)
+        self._clcs_send_effect_feedback(*pending)   # pylint: disable=not-an-iterable
 
     def _clcs_send_effect_feedback(self, data, page_path, server_state=''):
         """Send the feedback the website sends when the identity check ends"""
