@@ -43,6 +43,10 @@ SESSION_REFRESH_MIN_INTERVAL_SECS = 60
 class SessionHTTPRequests(SessionBase):
     """Manages the HTTP requests"""
 
+    def __init__(self):
+        super().__init__()
+        self._last_session_refresh = None
+
     def get(self, endpoint, **kwargs):
         """Execute a GET request to the designated endpoint."""
         return self._request_call(
@@ -255,6 +259,8 @@ class SessionHTTPRequests(SessionBase):
                 data_converted += f'&{auth_data}' if data_converted else auth_data
         return data_converted, headers, params
 
+    def assert_logged_in(self):
+        pass
 
 def _document_url(endpoint_address, kwargs):
     if 'append_to_address' in kwargs:

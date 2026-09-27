@@ -11,6 +11,7 @@
 import json
 import re
 from urllib.parse import quote
+from typing import Iterable
 
 import resources.lib.utils.website as website
 import resources.lib.common as common
@@ -88,6 +89,11 @@ def _mount_browser_tls(session):
 
 class SessionAccess(SessionCookie, SessionHTTPRequests):
     """Handle the authentication access"""
+
+    def __init__(self):
+        super().__init__()
+        self._pending_mfa_feedback = None
+        self._clcs_app_version = None
 
     @measure_exec_time_decorator(is_immediate=True)
     def prefetch_login(self):
@@ -291,7 +297,10 @@ class SessionAccess(SessionCookie, SessionHTTPRequests):
             response = self.session.get(ep.BASE_URL + page_path, headers=headers, timeout=10)
         response.raise_for_status()
         LOG.info('MFA: the check page for the profile {} is {}', guid, response.url)
+
+        # pylint: disable=unused-variable
         server_state, screen_update, country, _fields, app_version = _extract_clcs_bootstrap(response.content)
+
         self._clcs_app_version = app_version
         # The page offers more than one way to confirm the identity, the add-on can only use the code
         otp_screen_update = _extract_mfa_otp_screen_update(response.content)
@@ -367,7 +376,7 @@ class SessionAccess(SessionCookie, SessionHTTPRequests):
     def flush_mfa_feedback(self):
         """Send the feedback that closes the identity check, the website sends it last"""
         pending = getattr(self, '_pending_mfa_feedback', None)
-        if not pending:
+        if not isinstance(pending, Iterable):
             return
         self._pending_mfa_feedback = None
         self._clcs_send_effect_feedback(*pending)
@@ -611,7 +620,7 @@ def _select_clcs_action(screen):
         if node.get('__typename') != 'CLCSRequestScreenUpdate':
             continue
         requirements = node.get('inputFieldRequirements')
-        if not requirements or not node.get('serverScreenUpdate'):
+        if not isinstance(requirements, Iterable) or not node.get('serverScreenUpdate'):
             continue
         field_ids = [(req.get('field') or {}).get('id', '') for req in requirements]
         kind = _classify_clcs_fields(field_ids)
@@ -758,6 +767,6 @@ def _log_clcs_screen_diagnostics(screen):
             LOG.debug('CLCS screen alert node [{}]: {}', test_id, json.dumps(node)[:1200])
     for field_ids in actions:
         LOG.debug('CLCS screen action fields: {}', field_ids)
-    components = sorted({node.get('__typename') for node in _iter_clcs_nodes(screen)
-                         if isinstance(node.get('__typename'), str)})
+    components = sorted({typename for node in _iter_clcs_nodes(screen)
+                         if isinstance(typename := node.get('__typename'), str)})
     LOG.debug('CLCS screen components: {}', components)

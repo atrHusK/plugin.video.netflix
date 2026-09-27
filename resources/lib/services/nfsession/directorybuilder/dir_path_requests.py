@@ -837,7 +837,7 @@ def _graphql_cache_node(graphql_data, typename, video_id):
 
 def _log_carousel_sections(graphql_data):
     """Log the sections of the page and the kind of their entities"""
-    for key, section in graphql_data.items():
+    for key, section in graphql_data.items():   # pylint: disable=unused-variable
         if not isinstance(section, dict) or section.get('__typename') != 'PinotCarouselSection':
             continue
         connection = _graphql_ref_node(graphql_data, section.get('entities'))
@@ -1524,6 +1524,7 @@ class DirectoryPathRequests:
         # worse, makes the session look expired
         self.refused_video_list_fields = False
         self._browse_page_cache = None
+        self._loco_root_unavailable_since = None
 
     @cache_utils.cache_output(cache_utils.CACHE_MYLIST, fixed_identifier='my_list_items', ignore_self_class=True)
     # Same identifier the add and remove of my list keep updated, see _update_mylist_cache
@@ -2432,10 +2433,10 @@ class DirectoryPathRequests:
             has_next_page = bool(page_info.get('hasNextPage'))
             if not found and not has_next_page:
                 return
-        else:
-            if has_next_page:
-                LOG.warn('HOME ROWS: stopped after {} FetchMoreSections pages, Netflix has more rows',
-                         FETCH_MORE_SECTIONS_MAX_PAGES)
+        # When above FETCH_MORE_SECTIONS_MAX_PAGES print a warning in log that there are more rows
+        if has_next_page:
+            LOG.warn('HOME ROWS: stopped after {} FetchMoreSections pages, Netflix has more rows',
+                     FETCH_MORE_SECTIONS_MAX_PAGES)
 
     def req_home_rows(self):
         """Return the rows of the Netflix home page, in the order the website shows them"""
@@ -2502,8 +2503,8 @@ class DirectoryPathRequests:
         except InvalidVideoListTypeError as section_error:
             try:
                 browse_html = self._active_profile_browse_html(browse_html)
-            except InvalidVideoListTypeError:
-                raise section_error
+            except InvalidVideoListTypeError as exc:
+                raise section_error from exc
             graphql_data = self._browser_graphql_data(browse_html)
             section, connection = section_resolver(graphql_data)
         return graphql_data, section, connection
@@ -3204,6 +3205,7 @@ class DirectoryPathRequests:
 
     def req_video_list_search(self, search_term, perpetual_range_start=None):
         """Retrieve a video list by search term"""
+        # pylint: disable=unused-argument
         LOG.debug('Requesting video list by search term "{}"', search_term)
         return self._req_video_list_search_graphql(search_term)
 
