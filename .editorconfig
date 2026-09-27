@@ -15,8 +15,13 @@ trim_trailing_whitespace = true
 # A file must end with an empty line - this is good for version control systems
 insert_final_newline = true
 
-[*.{py,md,txt}]
+[*.{py,txt,xml}]
 indent_size = 4
+
+[*.{md,mdx,markdown}]
+indent_size = 4
+# KEEP trailing spaces (important for hard line breaks)
+trim_trailing_whitespace = false
 
 [makefile]
 # Use tabs for indentation (Makefiles require tabs)

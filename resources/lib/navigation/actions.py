@@ -7,10 +7,11 @@
     SPDX-License-Identifier: MIT
     See LICENSES/MIT.md for more information.
 """
+from urllib.parse import unquote, urlparse
+
 import xbmc
 import xbmcgui
 import xbmcplugin
-from urllib.parse import unquote, urlparse
 
 import resources.lib.common as common
 import resources.lib.kodi.ui as ui
@@ -121,7 +122,7 @@ class AddonActionExecutor:
             rating_info = api.get_thumb_rating_info(videoid)
         except Exception as exc:  # pylint: disable=broad-except
             LOG.warn('Unable to read the thumb rating of {} ({})', videoid, type(exc).__name__)
-            ui.show_ok_dialog('Netflix', common.get_local_string(30045).split('|')[0])
+            ui.show_ok_dialog('Netflix', common.get_local_string(30045).split('|', maxsplit=1)[0])
             return
         ui.show_rating_thumb_dialog(videoid=videoid,
                                     title=rating_info['title'],

@@ -18,7 +18,7 @@ import xbmc
 import resources.lib.common as common
 import resources.lib.utils.website as website
 from resources.lib.common import cache_utils
-from resources.lib.common.exceptions import (NotLoggedInError, MissingCredentialsError, WebsiteParsingError,
+from resources.lib.common.exceptions import (NotLoggedInError, WebsiteParsingError,
                                              MbrStatusAnonymousError, MetadataNotAvailable, LoginValidateError,
                                              InvalidProfilesError, ErrorMsgNoReport, CacheMiss, APIError)
 from resources.lib.globals import G
@@ -120,10 +120,9 @@ class NFSessionOperations(SessionPathRequests):
             self.dt_initial_page_prefetch = None
             return
         LOG.debug('Fetch initial page')
-        from requests import exceptions
         try:
             self.refresh_session_data(True)
-        except exceptions.TooManyRedirects:
+        except req_exceptions.TooManyRedirects:
             # This error can happen when the profile used in nf session actually no longer exists,
             # something wrong happen in the session then the server try redirect to the login page without success.
             # (CastagnaIT: i don't know the best way to handle this borderline case, but login again works)
@@ -160,12 +159,11 @@ class NFSessionOperations(SessionPathRequests):
 
     def _switch_profile_request(self, guid):
         """Switch the active profile server-side, with the previous address as fallback"""
-        from requests import exceptions
         try:
             self.get_safe('switch_profile',
                           params={'switchProfileGuid': guid, '_': int(time.time() * 1000)})
             return
-        except exceptions.HTTPError as exc:
+        except req_exceptions.HTTPError as exc:
             if getattr(exc.response, 'status_code', None) not in (400, 401, 403, 404, 410):
                 raise
             LOG.warn('Profile switch with the member api returned {}, using the previous address',

@@ -7,13 +7,14 @@
     SPDX-License-Identifier: MIT
     See LICENSES/MIT.md for more information.
 """
+import requests.exceptions as req_exceptions
+
 import resources.lib.common as common
 import resources.lib.kodi.ui as ui
 from resources.lib.common import cache_utils
 from resources.lib.globals import G
 from resources.lib.common.exceptions import (LoginError, MissingCredentialsError, CacheMiss, HttpError401, APIError,
                                              ErrorMsg)
-import requests.exceptions as req_exceptions
 from .api_paths import EPISODES_PARTIAL_PATHS, ART_PARTIAL_PATHS, build_paths
 from .logging import LOG, measure_exec_time_decorator
 from ..database.db_utils import TABLE_SESSION
