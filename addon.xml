@@ -94,13 +94,13 @@
     - Various search related fixes
     - Various thumbnail related fixes
     - Add to My list @twprh
-    - Empty "My list", "All TV Shows", "All Movies"
-    - "Continue watching" showing only 8 titles
-    - Various "New on Netflix" fixes
-    - Various "Top picks" fixes
+    - Empty 'My list', 'All TV Shows', 'All Movies'
+    - 'Continue watching' showing only 8 titles
+    - Various 'New on Netflix' fixes
+    - Various 'Top picks' fixes
     - Netflix trailers not always found, fallback to promo
     - Compatibility with python 3.8 @Publish3r
-    - UTF in "Continue watching" @jankofron
+    - UTF in 'Continue watching' @jankofron
     - Episode numbering @jankofron
     - Experimental fix: Disabled password verification (access.py)
   - Breezyslasher fixes 18-26
