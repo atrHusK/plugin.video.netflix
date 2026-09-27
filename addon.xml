@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<addon id="plugin.video.netflix" name="Netflix" version="2.0.6" provider-name="community">
+<addon id="plugin.video.netflix" name="Netflix" version="2.0.6b+atrHusK" provider-name="community">
     <requires>
         <import addon="xbmc.python" version="3.0.0"/>
         <import addon="script.module.addon.signals" version="0.0.6+matrix.1"/>
@@ -85,5 +85,34 @@
         <website>https://www.netflix.com</website>
         <forum>https://forum.kodi.tv/showthread.php?tid=329767</forum>
         <source>https://github.com/CastagnaIT/plugin.video.netflix</source>
+        <news>v2.0.6b+atrHusK (2026-09-12)
+- Rebased on Lekma's master which contains the following fixes compared to CastagnaIT/master since go-vegan patch 8
+  - go-vegan patch9 to 19:
+    - year information
+    - ignored resume position fix
+    - Various cast related fixes
+    - Various search related fixes
+    - Various thumbnail related fixes
+    - Add to My list @twprh
+    - Empty "My list", "All TV Shows", "All Movies"
+    - "Continue watching" showing only 8 titles
+    - Various "New on Netflix" fixes
+    - Various "Top picks" fixes
+    - Netflix trailers not always found, fallback to promo
+    - Compatibility with python 3.8 @Publish3r
+    - UTF in "Continue watching" @jankofron
+    - Episode numbering @jankofron
+    - Experimental fix: Disabled password verification (access.py)
+  - Breezyslasher fixes 18-26
+    - Support OTP for login
+    - Various api related changes and fixes
+  - jesubiag
+    - SQLite related fixes
+    - Various kodi related fixes
+  - atrHusK
+    - Dutch language file updates
+    - Forwarded Build and release related changes
+    - Forwarded a few minor corrections that fix nothing
+        </news>
     </extension>
 </addon>

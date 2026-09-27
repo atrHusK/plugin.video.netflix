@@ -43,9 +43,8 @@ body:
     attributes:
       label: Kodi version used
       options:
-        - Kodi 18 (Leia)
-        - Kodi 19 (Matrix)
         - Kodi 20 (Nexus)
+        - Kodi 21 (Omega)
         - Other (specify in description)
 
   - type: textarea
