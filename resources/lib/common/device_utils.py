@@ -8,10 +8,17 @@
     See LICENSES/MIT.md for more information.
 """
 import xbmc
+import xbmcaddon
 
 from resources.lib.globals import G
 from resources.lib.utils.esn import WidevineForceSecLev
 from resources.lib.utils.logging import LOG
+
+
+def version_greater_than(version1, version2):
+    v1 = tuple(map(int, version1.split(".")))
+    v2 = tuple(map(int, version2.split(".")))
+    return v1 > v2
 
 
 def select_port(service):
@@ -154,8 +161,14 @@ def get_user_agent(enable_android_mediaflag_fix=False):
         # Last number is the platform version of Chrome OS
         return base.replace('%PL%', '(X11; CrOS armv7l 15183.69.0)')
     if machine_arch.startswith('aarch'):
+        addon = xbmcaddon.Addon("script.module.inputstreamhelper")
+        plugin_version = addon.getAddonInfo("version")
+        if version_greater_than(plugin_version, "0.8.5"):
+            return base.replace('%PL%', '(X11; Linux x86_64)')
+
         # Last number is the platform version of Chrome OS
         return base.replace('%PL%', '(X11; CrOS aarch64 15183.69.0)')
+
     # x86 Linux
     return base.replace('%PL%', '(X11; Linux x86_64)')
 
