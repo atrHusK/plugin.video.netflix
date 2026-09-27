@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+# pylint: disable=too-many-lines,too-many-branches
 """
     Copyright (C) 2017 Sebastian Golasch (plugin.video.netflix)
     Copyright (C) 2020 Stefano Gottardo (original implementation module)
