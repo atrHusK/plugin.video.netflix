@@ -1,5 +1,9 @@
 v2.0.7
-- Rebased on @Lekma master which contains the following fixes compared to CastagnaIT/master since go-vegan patch 8
+- Experimental fix for non-chrome based widevine installations (inputstreamhelper >= 0.8.6) @rysson (and before that @mostman)
+- Dutch language file updates @atrHusK
+- Forwarded Build and release related changes @atrHusK
+- Forwarded a various minor corrections (plumbing) @atrHusK
+- Rebased on @Lekma master which contains the following updated and additional fixes (v1.24.1+atrHusK incorporated on go-vegan's patch8)
     - @go-vegan patch9 to 19:
         - year information
         - ignored resume position fix
@@ -22,12 +26,6 @@ v2.0.7
     - @jesubiag
         - SQLite related fixes
         - Various kodi related fixes
-- @atrHusK
-    - Dutch language file updates
-    - Forwarded Build and release related changes
-    - Forwarded a various minor corrections (plumbing)
-- @mostman
-    - Experimental fix for new Widevine installations on inputstreamhelper >= 0.8.6
 
 v1.24.1 (2026-06-29)
 - Should fix playback issues than can sometimes occur, like not starting at all or sound-only playback (jankofron)  
