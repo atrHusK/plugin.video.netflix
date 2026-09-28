@@ -7,6 +7,8 @@
     SPDX-License-Identifier: MIT
     See LICENSES/MIT.md for more information.
 """
+import requests.exceptions as req_exceptions
+
 import resources.lib.common as common
 import resources.lib.kodi.ui as ui
 from resources.lib.common import cache_utils
@@ -16,6 +18,39 @@ from resources.lib.common.exceptions import (LoginError, MissingCredentialsError
 from .api_paths import EPISODES_PARTIAL_PATHS, ART_PARTIAL_PATHS, build_paths
 from .logging import LOG, measure_exec_time_decorator
 from ..database.db_utils import TABLE_SESSION
+
+
+MY_LIST_GRAPHQL_MUTATIONS = {
+    'add': {
+        'operation_name': 'AddToPlaylist',
+        'operation_id': '8d985f07-2117-4add-980c-b83895549d1c',
+        'response_key': 'addEntityToPlaylist',
+        'expected_state': True
+    },
+    'remove': {
+        'operation_name': 'RemoveFromPlaylist',
+        'operation_id': '11403da1-d6fd-4cd7-9ad7-892554b70047',
+        'response_key': 'removeEntityFromPlaylist',
+        'expected_state': False
+    }
+}
+
+# The website sends the reminders of the not yet available titles with these mutations
+REMIND_ME_GRAPHQL_MUTATIONS = {
+    'add': {
+        'operation_name': 'AddReminder',
+        'operation_id': 'a5e82016-e05b-4704-b294-276399a300ec',
+        'response_key': 'addUnifiedEntityToRemindMe',
+        'expected_state': True
+    },
+    'remove': {
+        'operation_name': 'RemoveReminder',
+        'operation_id': 'd43e296a-cada-4621-95ad-1cebb05dac53',
+        'response_key': 'removeUnifiedEntityFromRemindMe',
+        'expected_state': False
+    }
+}
+GRAPHQL_OP_REMOVE_CONTINUE_WATCHING = 'be9e05b8-229b-4b3e-89b2-0db8681718e1'
 
 
 def logout():
@@ -36,19 +71,11 @@ def login(ask_credentials=True):
             is_login_with_credentials = ui.show_yesno_dialog('Login', common.get_local_string(30340),
                                                              yeslabel=common.get_local_string(30341),
                                                              nolabel=common.get_local_string(30342))
-            # if is_login_with_credentials:
-            #     credentials = {'credentials': ui.ask_credentials()}
-        if is_login_with_credentials:
-            # The login page is changed now part of HTML seem protected by reCaptcha
-            # in the HTML page the reactContext data is added after the reCaptcha checks so at the moment
-            # it is not accessible by requesting the login page through python script,
-            # this prevents us to get the authURL code needed to perform the login request
-            ui.show_ok_dialog('Login',
-                              'Due to new website protections at moment the login with credentials is not available.')
-            is_login_with_credentials = False
+            if is_login_with_credentials:
+                credentials = {'credentials': ui.ask_credentials()}
 
         if is_login_with_credentials:
-            if common.make_call('login', credentials):
+            if common.make_call('login', credentials, timeout=common.IPC_TIMEOUT_SECS_LOGIN):
                 is_success = True
         else:
             data = common.run_nf_authentication_key()
@@ -105,27 +132,100 @@ def rate(videoid, rating):
     ui.show_notification(common.get_local_string(30127).format(rating * 2))
 
 
+GRAPHQL_OP_DETAIL_MODAL = '7daad060-5725-4a2b-9d72-ffcfdc1b8760'
+GRAPHQL_OP_SET_THUMB_RATING = '36a7647d-e3b3-468c-a4e4-43e541e174c6'
+# The website sends the rating by name, the add-on menu has the first three
+THUMB_RATING_NAMES = ['THUMBS_UNRATED', 'THUMBS_DOWN', 'THUMBS_UP', 'THUMBS_WAY_UP']
+
+
+def get_thumb_rating_info(videoid):
+    """Return the title and the thumb rating the profile gave to a video"""
+    video_id = int(videoid.value)
+    response = common.make_call(
+        'post_graphql',
+        {'operation_name': 'DetailModal',
+         'operation_id': GRAPHQL_OP_DETAIL_MODAL,
+         'variables': {
+             'artworkContext': {},
+             'checkLinearChannel': True,
+             'fetchPromoVideoOverride': False,
+             'hasPromoVideoOverride': False,
+             'isLiveEpisodic': False,
+             'opaqueImageFormat': 'WEBP',
+             'promoVideoId': 0,
+             'textEvidenceUiContext': 'ODP',
+             'transparentImageFormat': 'WEBP',
+             'unifiedEntityId': f'Video:{video_id}',
+             'videoId': video_id,
+             'videoMerchContext': 'BROWSE',
+             'videoMerchEnabled': False
+         },
+         'referer': f'https://www.netflix.com/title/{video_id}'})
+    entities = common.get_path_safe(['data', 'unifiedEntities'], response, False, None) or []
+    entity = entities[0] if entities else None
+    if not entity:
+        LOG.debug('get_thumb_rating_info response: {}', response)
+        raise APIError('Unable to read the thumb rating, an error occurred in the request.')
+    name = entity.get('thumbRating') or entity.get('thumbsRating') or 'THUMBS_UNRATED'
+    LOG.info('RATE THUMB: the video {} is currently rated {}', videoid.value, name)
+    return {'title': entity.get('title') or '--',
+            'user_rating': THUMB_RATING_NAMES.index(name) if name in THUMB_RATING_NAMES else 0}
+
+
 @measure_exec_time_decorator()
 def rate_thumb(videoid, rating, track_id_jaw):
     """Rate a video on Netflix"""
     LOG.debug('Thumb rating {} as {}', videoid.value, rating)
-    event_uuid = common.get_random_uuid()
-    common.make_call(
-        'post_safe',
-        {'endpoint': 'set_thumb_rating',
-         'data': {
-             'eventUuid': event_uuid,
-             'titleId': int(videoid.value),
-             'trackId': track_id_jaw,
-             'rating': rating,
-         }})
-    ui.show_notification(common.get_local_string(30045).split('|')[rating])
+    try:
+        _rate_thumb_graphql(videoid, rating, track_id_jaw)
+    except (APIError, HttpError401, req_exceptions.HTTPError) as exc:
+        LOG.warn('Thumb rating with the website call failed ({}), using the previous one',
+                 type(exc).__name__)
+        common.make_call(
+            'post_safe',
+            {'endpoint': 'set_thumb_rating',
+             'data': {
+                 'eventUuid': common.get_random_uuid(),
+                 'titleId': int(videoid.value),
+                 'trackId': track_id_jaw,
+                 'rating': rating,
+             }})
+    if rating == 3:
+        ui.show_notification(common.get_local_string(30754))
+    else:
+        ui.show_notification(common.get_local_string(30045).split('|')[rating])
+
+
+def _rate_thumb_graphql(videoid, rating, track_id_jaw):
+    """Rate a video the way the website does"""
+    variables = {'entityId': f'Video:{videoid.value}',
+                 'rating': THUMB_RATING_NAMES[rating]}
+    if track_id_jaw and str(track_id_jaw) != 'None':
+        variables['trackId'] = int(track_id_jaw)
+    response = common.make_call(
+        'post_graphql',
+        {'operation_name': 'SetEntityThumbRating',
+         'operation_id': GRAPHQL_OP_SET_THUMB_RATING,
+         'variables': variables,
+         'referer': f'https://www.netflix.com/title/{videoid.value}'})
+    entity = common.get_path_safe(['data', 'setEntityThumbRating', 'entity'], response, False, None)
+    if not entity:
+        LOG.debug('rate_thumb response: {}', response)
+        raise APIError('Unable to rate the video, an error occurred in the request.')
+    LOG.info('RATE THUMB: Netflix set the video {} as {}', videoid.value,
+             entity.get('thumbRating') or entity.get('thumbsRating') or THUMB_RATING_NAMES[rating])
 
 
 def update_remindme(operation, videoid, trackid):
     """Call API to add / remove "Remind Me" to not available videos"""
     if trackid == 'None':
         raise ErrorMsg('Unable update remind me, trackid not found.')
+    try:
+        _update_remindme_graphql(operation, videoid, trackid)
+        return
+    except (APIError, HttpError401, req_exceptions.HTTPError) as exc:
+        LOG.warn('Remind me with the website call failed ({}), using the previous one',
+                 type(exc).__name__)
     response = common.make_call(
         'post_safe',
         {'endpoint': 'playlistop',
@@ -136,6 +236,29 @@ def update_remindme(operation, videoid, trackid):
              'trackId': int(trackid)
          }})
     LOG.debug('update_remindme response: {}', response)
+
+
+def _update_remindme_graphql(operation, videoid, trackid):
+    """Add or remove the reminder the way the website does"""
+    mutation = REMIND_ME_GRAPHQL_MUTATIONS.get(operation)
+    if not mutation:
+        raise APIError(f'Unsupported remind me operation: {operation}')
+    # The website asks for the title by its unified id, the plain number is not accepted
+    variables = {'entityId': f'Video:{videoid.value}'}
+    if trackid and str(trackid) != 'None':
+        variables['trackId'] = str(trackid)
+    response = common.make_call(
+        'post_graphql',
+        {'operation_name': mutation['operation_name'],
+         'operation_id': mutation['operation_id'],
+         'variables': variables,
+         'referer': f'https://www.netflix.com/title/{videoid.value}'})
+    entity = common.get_path_safe(['data', mutation['response_key']], response, False, None)
+    if not entity or entity.get('isInRemindMeList') != mutation['expected_state']:
+        LOG.debug('update_remindme response: {}', response)
+        raise APIError('Unable update remind me, an error occurred in the request.')
+    LOG.info('REMIND ME: the reminder of the title {} was {}',
+             videoid.value, 'added' if operation == 'add' else 'removed')
     # 05/10/2022: The remove action by using this new callpath not works
     # op = 'addToRemindMeList' if operation == 'add' else 'removeToRemindMeList'
     # call_args = {
@@ -152,20 +275,26 @@ def update_remindme(operation, videoid, trackid):
 @measure_exec_time_decorator()
 def update_my_list(videoid, operation, params):
     """Call API to add / remove videos to my list"""
-    if params['trackid'] == 'None':
-        raise ErrorMsg('Unable update my list, trackid not found.')
+    mutation = MY_LIST_GRAPHQL_MUTATIONS.get(operation)
+    if not mutation:
+        raise APIError(f'Unsupported my list operation: {operation}')
+
     LOG.debug('My List: {} {}', operation, videoid)
+    variables = {'entityId': str(videoid.value)}
+    trackid = params.get('trackid')
+    if trackid and trackid != 'None':
+        variables['trackId'] = str(trackid)
+
     response = common.make_call(
-        'post_safe',
-        {'endpoint': 'playlistop',
-         'data': {
-             'lolomoId': 'unknown',
-             'operation': operation,
-             'videoId': int(videoid.value),
-             'trackId': int(params['trackid']),
-             'skipRootInvalidation': True,
-         }})
-    if response.get('status') != 'success':
+        'post_graphql',
+        {'operation_name': mutation['operation_name'],
+         'operation_id': mutation['operation_id'],
+         'variables': variables,
+         'referer': f'https://www.netflix.com/title/{videoid.value}'})
+    entity = (response.get('data', {})
+              .get(mutation['response_key'], {})
+              .get('entity', {}))
+    if entity.get('isInPlaylist') != mutation['expected_state']:
         LOG.debug('update_my_list response: {}', response)
         raise APIError('Unable update my list, an error occurred in the request.')
     _update_mylist_cache(videoid, operation, params)
@@ -192,12 +321,11 @@ def _update_mylist_cache(videoid, operation, params):
         except CacheMiss:
             pass
     else:
-        common.make_call('add_videoids_to_video_list_cache', {'cache_bucket': cache_utils.CACHE_MYLIST,
-                                                              'cache_identifier': mylist_identifier,
-                                                              'video_ids': [videoid.value]})
+        G.CACHE.delete(cache_utils.CACHE_MYLIST, mylist_identifier)
         try:
             my_list_videoids = G.CACHE.get(cache_utils.CACHE_MYLIST, 'my_list_items')
-            my_list_videoids.append(videoid)
+            if videoid not in my_list_videoids:
+                my_list_videoids.append(videoid)
             G.CACHE.add(cache_utils.CACHE_MYLIST, 'my_list_items', my_list_videoids)
         except CacheMiss:
             pass
@@ -206,21 +334,28 @@ def _update_mylist_cache(videoid, operation, params):
 @measure_exec_time_decorator()
 def get_parental_control_data(guid, password):
     """Get the parental control data"""
-    return common.make_call('parental_control_data', {'guid': guid, 'password': password})
+    return common.make_call('parental_control_data', {'guid': guid, 'password': password},
+                            timeout=common.IPC_TIMEOUT_SECS_LOGIN)
 
 
 @measure_exec_time_decorator()
 def set_parental_control_data(data):
     """Set the parental control data"""
-    common.make_call(
-        'post_safe',
-        {'endpoint': 'content_restrictions',
-         'data': {'action': 'update',
-                  'authURL': data['token'],
-                  'experience': data['experience'],
-                  'guid': data['guid'],
-                  'maturity': data['maturity']}}
-    )
+    common.make_call('set_parental_control_data', {'data': data})
+
+
+@measure_exec_time_decorator()
+def set_profile_lock(guid, pin):
+    """Set the PIN that locks a profile, Netflix asks to confirm the identity first"""
+    common.make_call('set_profile_lock', {'guid': guid, 'pin': str(pin)},
+                     timeout=common.IPC_TIMEOUT_SECS_LOGIN)
+
+
+@measure_exec_time_decorator()
+def remove_profile_lock(guid):
+    """Remove the PIN that locks a profile"""
+    common.make_call('set_profile_lock', {'guid': guid, 'pin': ''},
+                     timeout=common.IPC_TIMEOUT_SECS_LOGIN)
 
 
 @measure_exec_time_decorator()
@@ -234,44 +369,54 @@ def verify_profile_lock(guid, pin):
                       'action': 'verify',
                       'guid': guid}}
         )
-        return response.get('success') is True
+        is_valid = response.get('success') is True
+        LOG.info('PROFILE PIN: Netflix {} the PIN of the profile {}',
+                 'accepted' if is_valid else 'refused', guid)
+        return is_valid
     except HttpError401:  # Wrong PIN
+        LOG.info('PROFILE PIN: the PIN of the profile {} is wrong', guid)
         return False
+    except Exception as exc:  # pylint: disable=broad-except
+        LOG.error('PROFILE PIN: the check of the profile {} failed ({})', guid, exc)
+        raise
+
+
+# The three groups of language genres the "Browse by language" page of the website asks
+ORIGINAL_AUDIO_LANGUAGES_GENRE = 81555714
+SUBTITLE_LANGUAGES_GENRE = 81586477
+DUBBING_LANGUAGES_GENRE = 81586478
+
+
+def _get_languages_of_genre(genre_id):
+    """Get the languages listed as sub-genres of one of the language genres"""
+    call_args = {
+        'paths': [['genres', genre_id, 'subgenres', {'from': 0, 'to': 50},
+                   ['id', 'name', 'languageCode']]]
+    }
+    response = common.make_call('path_request', call_args)
+    lang_list = {}
+    data_list = response.get('genres', {}).get(str(genre_id), {}).get('subgenres', {})
+    for lang_dict in data_list.values():
+        lang_id = lang_dict['id'].get('value')
+        if lang_id is None:  # The list is padded to the requested length, the rest is empty
+            continue
+        lang_list[lang_id] = lang_dict['name']['value']
+    return lang_list
 
 
 def get_available_audio_languages():
-    """Get the list of available audio languages of videos"""
-    # originalAudioLanguages genres: 81555714
-    call_args = {
-        'paths': [['genres', 81555714, 'subgenres', {'to': 50}, ['id', 'name', 'languageCode']]]
-    }
-    response = common.make_call('path_request', call_args)
-    lang_list = {}
-    data_list = response.get('genres', {}).get('81555714', {}).get('subgenres', {})
-    for lang_dict in data_list.values():
-        lang_id = lang_dict['id'].get('value')
-        if lang_id is None:  # If none the list is ended
-            break
-        lang_list[lang_id] = lang_dict['name']['value']
-    return lang_list
+    """Get the list of available original audio languages of videos"""
+    return _get_languages_of_genre(ORIGINAL_AUDIO_LANGUAGES_GENRE)
 
-# todo: dubbingLanguages genres: 81586478
 
 def get_available_subtitles_languages():
     """Get the list of available subtitles languages of videos"""
-    # subtitleLanguages genres: 81586477
-    call_args = {
-        'paths': [['genres', 81586477, 'subgenres', {'to': 50}, ['id', 'name', 'languageCode']]]
-    }
-    response = common.make_call('path_request', call_args)
-    lang_list = {}
-    data_list = response.get('genres', {}).get('81586477', {}).get('subgenres', {})
-    for lang_dict in data_list.values():
-        lang_id = lang_dict['id'].get('value')
-        if lang_id is None:  # If none the list is ended
-            break
-        lang_list[lang_id] = lang_dict['name']['value']
-    return lang_list
+    return _get_languages_of_genre(SUBTITLE_LANGUAGES_GENRE)
+
+
+def get_available_dubbed_languages():
+    """Get the list of available dubbing languages of videos"""
+    return _get_languages_of_genre(DUBBING_LANGUAGES_GENRE)
 
 
 def get_genre_title(genre_id):
@@ -288,6 +433,12 @@ def get_genre_title(genre_id):
 
 def remove_watched_status(videoid):
     """Request to delete the watched status of a video (delete also the item from "continue watching" list)"""
+    try:
+        _remove_watched_status_graphql(videoid)
+        return
+    except (APIError, HttpError401, req_exceptions.HTTPError) as exc:
+        LOG.warn('Remove watched status with the website call failed ({}), using the previous one',
+                 type(exc).__name__)
     call_args = {
         'callpaths': [['removeVideosFromContinueWatching', [int(videoid.value)]]]
     }
@@ -308,6 +459,22 @@ def remove_watched_status(videoid):
     # except Exception as exc:  # pylint: disable=broad-except
     #     LOG.error('remove_watched_status raised this error: {}', exc)
     #     return False
+
+
+def _remove_watched_status_graphql(videoid):
+    """Remove the item from "continue watching" the way the website does"""
+    # The website asks for the title by its unified id, the plain number is not accepted
+    response = common.make_call(
+        'post_graphql',
+        {'operation_name': 'RemoveFromContinueWatching',
+         'operation_id': GRAPHQL_OP_REMOVE_CONTINUE_WATCHING,
+         'variables': {'unifiedEntityId': f'Video:{videoid.value}'},
+         'referer': f'https://www.netflix.com/title/{videoid.value}'})
+    if not common.get_path_safe(['data', 'removeFromContinueWatching', 'success'], response,
+                                False, False):
+        LOG.debug('remove_watched_status response: {}', response)
+        raise APIError('Unable to remove watched status, an error occurred in the request.')
+    LOG.info('CONTINUE WATCHING: the title {} was removed', videoid.value)
 
 
 def get_metadata(videoid, refresh=False):

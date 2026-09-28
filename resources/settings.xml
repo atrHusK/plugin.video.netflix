@@ -448,6 +448,11 @@
                         <dependency type="visible" setting="show_menu_mylist">true</dependency>
                     </dependencies>
                 </setting>
+                <setting id="show_menu_homerows" type="boolean" label="30750" help="30751">
+                    <level>0</level>
+                    <default>true</default>
+                    <control type="toggle"/>
+                </setting>
                 <setting id="show_menu_continuewatching" type="boolean" label="30168" help="">
                     <level>0</level>
                     <default>true</default>

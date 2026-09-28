@@ -7,6 +7,7 @@
     SPDX-License-Identifier: MIT
     See LICENSES/MIT.md for more information.
 """
+import xbmcgui
 import xbmcplugin
 
 import resources.lib.common as common
@@ -16,6 +17,7 @@ from resources.lib.database.db_utils import TABLE_MENU_DATA
 from resources.lib.globals import G
 from resources.lib.navigation.directory_utils import (finalize_directory, custom_viewmode,
                                                       end_of_directory, get_title, activate_profile, auto_scroll)
+from resources.lib.common.exceptions import InvalidVideoListTypeError
 from resources.lib.utils.logging import LOG, measure_exec_time_decorator
 
 
@@ -32,6 +34,20 @@ from resources.lib.utils.logging import LOG, measure_exec_time_decorator
 # The 'pathitems':
 #  It should match the 'path' key in MAIN_MENU_ITEMS of globals.py (or when not listed the dynamic menu item)
 #  the indexes are: 0 the function name of this 'Directory' class, 1 the menu id, 2 an optional id
+
+
+def _get_menu_data(menu_id):
+    """Get the data of a menu, from the hardcoded menus or from the dynamic menus (stored in the DB)"""
+    menu_data = G.MAIN_MENU_ITEMS.get(menu_id)
+    if not menu_data:  # Dynamic menus
+        menu_data = G.LOCAL_DB.get_value(menu_id, table=TABLE_MENU_DATA, data_type=dict)
+    if not menu_data:
+        # Can happen with Kodi widgets/favourites/shortcuts saved with a previous add-on version that
+        # reference a menu that no longer exists, 'None' must not be sent to the service (TypeError)
+        from resources.lib.common.exceptions import InvalidPathError
+        raise InvalidPathError(f'The menu "{menu_id}" is no longer available. '
+                               'If used by a widget/favourite/shortcut, remove and add it again.')
+    return menu_data
 
 
 class Directory:
@@ -153,13 +169,13 @@ class Directory:
     @custom_viewmode(G.VIEW_SHOW)
     def video_list(self, pathitems):
         """Show a video list of a list ID"""
-        menu_data = G.MAIN_MENU_ITEMS.get(pathitems[1])
-        if not menu_data:  # Dynamic menus
-            menu_data = G.LOCAL_DB.get_value(pathitems[1], table=TABLE_MENU_DATA, data_type=dict)
+        menu_data = _get_menu_data(pathitems[1])
+        list_id = pathitems[2] if len(pathitems) > 2 else pathitems[1]
+        is_dynamic_id = len(pathitems) > 2 and not G.is_known_menu_context(list_id)
         call_args = {
-            'list_id': pathitems[2],
+            'list_id': list_id,
             'menu_data': menu_data,
-            'is_dynamic_id': not G.is_known_menu_context(pathitems[2])
+            'is_dynamic_id': is_dynamic_id
         }
         dir_items, extra_data = common.make_call('get_video_list', call_args)
 
@@ -172,17 +188,23 @@ class Directory:
     @custom_viewmode(G.VIEW_SHOW)
     def video_list_sorted(self, pathitems):
         """Show a video list sorted of a 'context' name"""
-        menu_data = G.MAIN_MENU_ITEMS.get(pathitems[1])
-        if not menu_data:  # Dynamic menus
-            menu_data = G.LOCAL_DB.get_value(pathitems[1], table=TABLE_MENU_DATA, data_type=dict)
+        menu_data = _get_menu_data(pathitems[1])
         call_args = {
             'pathitems': pathitems,
             'menu_data': menu_data,
             'sub_genre_id': self.params.get('sub_genre_id'),  # Used to show the sub-genre folder when sub-genres exists
             'perpetual_range_start': self.perpetual_range_start,
-            'is_dynamic_id': not G.is_known_menu_context(pathitems[2])
+            'is_dynamic_id': len(pathitems) > 2 and not G.is_known_menu_context(pathitems[2])
         }
-        dir_items, extra_data = common.make_call('get_video_list_sorted', call_args)
+        # My List is read in pages, it needs more time than an ordinary list
+        timeout = (common.IPC_TIMEOUT_SECS_PAGE_PARSE if menu_data['path'][1] == 'myList'
+                   else common.IPC_TIMEOUT_SECS)
+        try:
+            dir_items, extra_data = common.make_call('get_video_list_sorted', call_args, timeout=timeout)
+        except InvalidVideoListTypeError as exc:
+            # Netflix no longer provides the contents of this list, show it as empty
+            LOG.warn('The list is not available ({})', exc)
+            dir_items, extra_data = [], {}
         sort_type = 'sort_nothing'
         if menu_data['path'][1] == 'myList' and int(G.ADDON.getSettingInt('menu_sortorder_mylist')) == 0:
             # At the moment it is not possible to make a query with results sorted for the 'mylist',
@@ -196,9 +218,45 @@ class Directory:
 
     @measure_exec_time_decorator()
     @custom_viewmode(G.VIEW_FOLDER)
+    def home_rows(self, pathitems):
+        """Show the rows of the Netflix home page as folders"""
+        menu_data = G.MAIN_MENU_ITEMS.get(pathitems[1])
+        try:
+            dir_items, extra_data = common.make_call('get_home_rows', {'menu_data': menu_data},
+                                                     timeout=common.IPC_TIMEOUT_SECS_PAGE_PARSE)
+        except InvalidVideoListTypeError as exc:
+            LOG.warn('The Netflix home rows are not available ({})', exc)
+            dir_items, extra_data = [], {}
+        finalize_directory(dir_items, G.CONTENT_FOLDER,
+                           title=get_title(menu_data, extra_data), sort_type='sort_nothing')
+        end_of_directory(self.dir_update_listing)
+        return menu_data.get('view')
+
+    @measure_exec_time_decorator()
+    @custom_viewmode(G.VIEW_SHOW)
+    def home_row(self, pathitems):
+        """Show the videos of a single row of the Netflix home page"""
+        menu_data = G.LOCAL_DB.get_value(pathitems[2], table=TABLE_MENU_DATA, data_type=dict)
+        if not menu_data:
+            menu_data = G.MAIN_MENU_ITEMS.get(pathitems[1])
+        try:
+            dir_items, extra_data = common.make_call('get_home_row_videos',
+                                                     {'row_index': pathitems[2],
+                                                      'menu_data': menu_data},
+                                                     timeout=common.IPC_TIMEOUT_SECS_PAGE_PARSE)
+        except InvalidVideoListTypeError as exc:
+            LOG.warn('The Netflix home row is not available ({})', exc)
+            dir_items, extra_data = [], {}
+        finalize_directory(dir_items, menu_data.get('content_type', G.CONTENT_SHOW),
+                           title=get_title(menu_data, extra_data), sort_type='sort_nothing')
+        end_of_directory(self.dir_update_listing)
+        return menu_data.get('view')
+
+    @measure_exec_time_decorator()
+    @custom_viewmode(G.VIEW_FOLDER)
     def category_list(self, pathitems):
         """Show a list of folders of a LoLoMo category"""
-        menu_data = G.MAIN_MENU_ITEMS.get(pathitems[1])
+        menu_data = _get_menu_data(pathitems[1])
         call_args = {
             'menu_data': menu_data
         }
@@ -213,7 +271,7 @@ class Directory:
     @custom_viewmode(G.VIEW_FOLDER)
     def recommendations(self, pathitems):
         """Show video lists for a genre"""
-        menu_data = G.MAIN_MENU_ITEMS.get(pathitems[1])
+        menu_data = _get_menu_data(pathitems[1])
         call_args = {
             'menu_data': menu_data,
             'genre_id': None,
@@ -228,6 +286,22 @@ class Directory:
 
     @measure_exec_time_decorator()
     @custom_viewmode(G.VIEW_SHOW)
+    def similar(self, pathitems):  # pylint: disable=unused-argument
+        """Show the titles the website suggests next to a tv show / movie"""
+        menu_data = {'path': ['is_context_menu_item', 'is_context_menu_item'],
+                     'title': common.get_local_string(30415)}
+        from json import loads
+        call_args = {
+            'menu_data': menu_data,
+            'video_id_dict': loads(self.params['video_id_dict'])
+        }
+        dir_items, extra_data = common.make_call('get_similar_video_list', call_args)
+        finalize_directory(dir_items, G.CONTENT_SHOW, 'sort_nothing',
+                           title=get_title(menu_data, extra_data))
+        end_of_directory(False)
+
+    @measure_exec_time_decorator()
+    @custom_viewmode(G.VIEW_SHOW)
     def supplemental(self, pathitems):  # pylint: disable=unused-argument
         """Show supplemental video list (eg. trailers) of a tv show / movie"""
         menu_data = {'path': ['is_context_menu_item', 'is_context_menu_item'],  # Menu item do not exists
@@ -239,6 +313,28 @@ class Directory:
             'supplemental_type': self.params['supplemental_type']
         }
         dir_items, extra_data = common.make_call('get_video_list_supplemental', call_args)
+        if not dir_items:
+            videoid = common.VideoId.from_dict(call_args['video_id_dict'])
+            direct_trailer = common.make_call('get_direct_trailer', videoid) or {}
+            trailer_url = direct_trailer.get('url', '')
+            if trailer_url:
+                title = direct_trailer.get('title') or common.get_local_string(30179)
+                list_item = xbmcgui.ListItem(title, path=trailer_url, offscreen=True)
+                infos = {'Title': title}
+                if direct_trailer.get('synopsis'):
+                    infos['Plot'] = direct_trailer['synopsis']
+                    infos['PlotOutline'] = direct_trailer['synopsis']
+                if direct_trailer.get('year'):
+                    infos['Year'] = direct_trailer['year']
+                list_item.setInfo('video', infos)
+                if direct_trailer.get('poster'):
+                    list_item.setArt({
+                        'poster': direct_trailer['poster'],
+                        'thumb': direct_trailer['poster']
+                    })
+                list_item.setProperty('isPlayable', 'true')
+                list_item.setContentLookup(False)
+                dir_items = [(trailer_url, list_item, False)]
 
         finalize_directory(dir_items, menu_data.get('content_type', G.CONTENT_SHOW),
                            title=get_title(menu_data, extra_data))
@@ -249,9 +345,7 @@ class Directory:
     @custom_viewmode(G.VIEW_FOLDER)
     def genres(self, pathitems):
         """Show loco list of a genre or from loco root the list of contexts specified in the menu data"""
-        menu_data = G.MAIN_MENU_ITEMS.get(pathitems[1])
-        if not menu_data:  # Dynamic menus
-            menu_data = G.LOCAL_DB.get_value(pathitems[1], table=TABLE_MENU_DATA, data_type=dict)
+        menu_data = _get_menu_data(pathitems[1])
         call_args = {
             'menu_data': menu_data,
             # When genre_id is None is loaded the loco root the list of contexts specified in the menu data
@@ -266,9 +360,39 @@ class Directory:
         return menu_data.get('view')
 
     @custom_viewmode(G.VIEW_FOLDER)
+    def audio_description(self, pathitems):
+        """Show the collections of a search, or the videos of one of them"""
+        menu_data = G.MAIN_MENU_ITEMS[pathitems[1]]
+        search_term = menu_data['search_term']
+        if len(pathitems) < 3:
+            dir_items, extra_data = common.make_call('get_collections',
+                                                     {'menu_data': menu_data,
+                                                      'search_term': search_term})
+            finalize_directory(dir_items, G.CONTENT_FOLDER,
+                               title=get_title(menu_data, extra_data), sort_type='sort_label')
+            end_of_directory(False)
+            return menu_data.get('view')
+        collection_key = pathitems[2]
+        sub_menu_data = G.LOCAL_DB.get_value(collection_key, table=TABLE_MENU_DATA,
+                                             data_type=dict) or menu_data
+        collection_id = sub_menu_data.get('collection_id') or collection_key.replace('_', ':', 1)
+        call_args = {
+            'menu_data': sub_menu_data,
+            'collection_id': collection_id,
+            'collection_name': sub_menu_data.get('collection_name', collection_id),
+            'search_term': search_term,
+            'pathitems': pathitems
+        }
+        dir_items, extra_data = common.make_call('get_collection_video_list', call_args)
+        finalize_directory(dir_items, menu_data.get('content_type', G.CONTENT_SHOW),
+                           title=get_title(sub_menu_data, extra_data), sort_type='sort_label')
+        end_of_directory(False)
+        return menu_data.get('view')
+
+    @custom_viewmode(G.VIEW_FOLDER)
     def subgenres(self, pathitems):
         """Show a lists of sub-genres of a 'genre id'"""
-        menu_data = G.MAIN_MENU_ITEMS[pathitems[1]]
+        menu_data = _get_menu_data(pathitems[1])
         call_args = {
             'menu_data': menu_data,
             'genre_id': pathitems[2]

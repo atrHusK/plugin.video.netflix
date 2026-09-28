@@ -59,6 +59,9 @@ CONTEXT_MENU_ACTIONS = {
     'trailer': {
         'label': common.get_local_string(30179),
         'url': ctx_item_url(['trailer'])},
+    'similar': {
+        'label': common.get_local_string(30415),
+        'url': ctx_item_url(['similar'])},
     'force_update_list': {
         'label': common.get_local_string(30214),
         'url': ctx_item_url(['force_update_list'])},
@@ -83,6 +86,9 @@ CONTEXT_MENU_ACTIONS = {
     'profile_remember_pin': {
         'label': common.get_local_string(30057),
         'url': ctx_item_url(['profile_remember_pin'])},
+    'profile_lock': {
+        'label': common.get_local_string(30755),
+        'url': ctx_item_url(['profile_lock'])},
     'profile_parental_control': {
         'label': common.get_local_string(30062),
         'url': ctx_item_url(['parental_control'])},

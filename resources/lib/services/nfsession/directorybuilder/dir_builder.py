@@ -7,15 +7,27 @@
     SPDX-License-Identifier: MIT
     See LICENSES/MIT.md for more information.
 """
-from resources.lib.utils.data_types import merge_data_type
-from resources.lib.common.exceptions import CacheMiss
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import resources.lib.common as common
+from resources.lib.utils.data_types import merge_data_type, CustomVideoList
+from resources.lib.common.cache_utils import CACHE_COMMON
+from resources.lib.common.exceptions import CacheMiss, InvalidPathError, InvalidVideoListTypeError
 from resources.lib.common import VideoId
 from resources.lib.globals import G
+from resources.lib.utils.api_paths import ART_SIZE_FHD, ART_SIZE_POSTER
 from resources.lib.services.nfsession.directorybuilder.dir_builder_items \
-    import (build_video_listing, build_subgenres_listing, build_season_listing, build_episode_listing,
-            build_loco_listing, build_mainmenu_listing, build_profiles_listing, build_lolomo_category_listing)
-from resources.lib.services.nfsession.directorybuilder.dir_path_requests import DirectoryPathRequests
-from resources.lib.utils.logging import measure_exec_time_decorator
+    import (build_video_listing, build_subgenres_listing, build_collections_listing, build_season_listing, build_episode_listing,
+            build_loco_listing, build_mainmenu_listing, build_profiles_listing, build_lolomo_category_listing,
+            build_home_rows_listing)
+from resources.lib.services.nfsession.directorybuilder.dir_path_requests import (DirectoryPathRequests,
+                                                                                 _has_reference_entries,
+                                                                                 _metadata_has_cast_names,
+                                                                                 _metadata_image_url,
+                                                                                 _metadata_year,
+                                                                                 metadata_with_title_page_fallback,
+                                                                                 normalize_metadata_references)
+from resources.lib.utils.logging import LOG, measure_exec_time_decorator
 
 
 class DirectoryBuilder(DirectoryPathRequests):
@@ -40,13 +52,28 @@ class DirectoryBuilder(DirectoryPathRequests):
             self.get_subgenres,
             self.get_mylist_videoids_profile_switch,
             self.add_videoids_to_video_list_cache,
-            self.get_continuewatching_videoid_exists
+            self.get_continuewatching_videoid_exists,
+            self.get_home_rows,
+            self.get_home_row_videos,
+            self.get_collections,
+            self.get_collection_video_list,
+            self.get_similar_video_list
         ]
 
     @measure_exec_time_decorator(is_immediate=True)
     def get_mainmenu(self):
         loco_list = self.req_loco_list_root()
         return build_mainmenu_listing(loco_list)
+
+    @measure_exec_time_decorator(is_immediate=True)
+    def get_home_rows(self, menu_data):
+        return build_home_rows_listing(self.req_home_rows(), menu_data)
+
+    @measure_exec_time_decorator(is_immediate=True)
+    def get_home_row_videos(self, row_index, menu_data):
+        video_list = self.req_home_row_videos(row_index, menu_data.get('home_row_id'))
+        self._enrich_video_list_art(video_list, include_refs=True)
+        return build_video_listing(video_list, menu_data, mylist_items=self.req_mylist_items())
 
     @measure_exec_time_decorator(is_immediate=True)
     def get_profiles(self, request_update, preselect_guid=None, detailed_info=True):
@@ -66,61 +93,311 @@ class DirectoryBuilder(DirectoryPathRequests):
     def get_seasons(self, pathitems, tvshowid_dict, perpetual_range_start):
         tvshowid = VideoId.from_dict(tvshowid_dict)
         season_list = self.req_seasons(tvshowid, perpetual_range_start=perpetual_range_start)
+        self._enrich_parent_cast(season_list, tvshowid.tvshowid)
         return build_season_listing(season_list, tvshowid, pathitems)
 
     @measure_exec_time_decorator(is_immediate=True)
     def get_episodes(self, pathitems, seasonid_dict, perpetual_range_start):
         seasonid = VideoId.from_dict(seasonid_dict)
         episodes_list = self.req_episodes(seasonid, perpetual_range_start=perpetual_range_start)
+        self._enrich_parent_cast(episodes_list, seasonid.tvshowid)
         return build_episode_listing(episodes_list, seasonid, pathitems)
+
+    def _enrich_parent_cast(self, video_list, tvshow_id):
+        """Add the series cast once so season and episode items can inherit it."""
+        raw_data = getattr(video_list, 'data', None)
+        videos = raw_data.get('videos') if isinstance(raw_data, dict) else None
+        if not isinstance(videos, dict):
+            return
+        tvshow = videos.get(str(tvshow_id))
+        if not isinstance(tvshow, dict):
+            try:
+                tvshow = videos.get(int(tvshow_id))
+            except (TypeError, ValueError):
+                tvshow = None
+        if not isinstance(tvshow, dict) or _has_reference_entries(tvshow, 'cast'):
+            return
+        metadata = self.req_title_cast_metadata(tvshow_id)
+        if _metadata_has_cast_names(metadata):
+            normalize_metadata_references(raw_data, tvshow_id, metadata, tvshow)
 
     @measure_exec_time_decorator(is_immediate=True)
     def get_video_list(self, list_id, menu_data, is_dynamic_id):
-        if not is_dynamic_id:
-            list_id = self.get_loco_list_id_by_context(menu_data['loco_contexts'][0])
-        # pylint: disable=unexpected-keyword-arg
-        video_list = self.req_video_list(list_id, no_use_cache=menu_data.get('no_use_cache'))
+        menu_id = menu_data['path'][1]
+        defer_title_details = (
+            is_dynamic_id
+            and menu_data.get('initial_menu_id') == 'newAndPopular')
+        cache_enriched_list = (
+            (defer_title_details or (not is_dynamic_id and menu_id == 'chosenForYou'))
+            and not menu_data.get('no_use_cache'))
+        enriched_cache_id = f'enriched_video_list_cast_v1_{list_id}'
+        video_list = None
+        if cache_enriched_list:
+            try:
+                video_list = G.CACHE.get(CACHE_COMMON, enriched_cache_id)
+            except CacheMiss:
+                pass
+        current_contexts = {
+            'currentTitles': ('windowedNewReleases',),
+            'mostViewed': ('mostWatched',)
+        }
+        if video_list is None:
+            if not is_dynamic_id and menu_id == 'continueWatching':
+                video_list = self._browser_continue_watching_list()
+            elif not is_dynamic_id and menu_id == 'chosenForYou':
+                video_list = self._browser_top_picks_list()
+            elif not is_dynamic_id and menu_id in current_contexts:
+                video_list = self._video_list_from_lolomo_category_context(
+                    'comingSoon', current_contexts[menu_id], fallback_first=True)
+            else:
+                if not is_dynamic_id:
+                    list_id = self.get_loco_list_id_by_context(menu_data['loco_contexts'][0])
+                # pylint: disable=unexpected-keyword-arg
+                video_list = self.req_video_list(
+                    list_id, menu_data=menu_data, no_use_cache=menu_data.get('no_use_cache'))
+            if menu_id == 'continueWatching':
+                self._enrich_video_list_art(
+                    video_list, include_refs=True, art_only=True)
+            else:
+                # New & Popular rows can contain dozens of titles. The browser
+                # response already supplies titles and contextual artwork. Keep
+                # slower detail enrichment deferred there, but attach cast with
+                # the bounded DetailModal batch before Kodi builds ListItems.
+                self._enrich_video_list_art(
+                    video_list,
+                    include_refs=True,
+                    art_only=defer_title_details)
+            if cache_enriched_list:
+                G.CACHE.add(CACHE_COMMON, enriched_cache_id, video_list)
         return build_video_listing(video_list, menu_data,
                                    mylist_items=self.req_mylist_items())
 
     @measure_exec_time_decorator(is_immediate=True)
     def get_video_list_sorted(self, pathitems, menu_data, sub_genre_id, perpetual_range_start, is_dynamic_id):
         context_id = None
-        if is_dynamic_id and pathitems[2] != 'None':
+        if is_dynamic_id and len(pathitems) > 2 and pathitems[2] != 'None':
             # Dynamic IDs for common video lists
             # The context_id can be:
             # -In the loco list: 'video list id'
             # -In the video list: 'sub-genre id'
             # -In the list of genres: 'sub-genre id'
             context_id = pathitems[2]
-        # pylint: disable=unexpected-keyword-arg
-        video_list = self.req_video_list_sorted(menu_data['request_context_name'],
-                                                context_id=context_id,
-                                                perpetual_range_start=perpetual_range_start,
-                                                menu_data=menu_data,
-                                                no_use_cache=menu_data.get('no_use_cache'))
+        if menu_data['path'][1] == 'recentlyAdded' and context_id:
+            video_list = self._video_list_from_lolomo_category_context(
+                'comingSoon', ('windowedNewReleases', 'newThisWeek', 'newOnNetflix', 'newOnNetflixThisWeek'),
+                fallback_first=True)
+            self._filter_unavailable_videos(video_list)
+        else:
+            # pylint: disable=unexpected-keyword-arg
+            video_list = self.req_video_list_sorted(menu_data['request_context_name'],
+                                                    context_id=context_id,
+                                                    perpetual_range_start=perpetual_range_start,
+                                                    menu_data=menu_data,
+                                                    no_use_cache=menu_data.get('no_use_cache'))
+        # The lists read with the fields of the website carry no cast and no genres,
+        # asking them item by item would cost a request per item
+        website_fields = bool(getattr(video_list, 'data', {}).get('_website_fields'))
+        self._enrich_video_list_art(video_list, include_refs=not website_fields,
+                                    art_only=website_fields)
         return build_video_listing(video_list, menu_data, sub_genre_id, pathitems, perpetual_range_start,
                                    self.req_mylist_items())
 
+    def _enrich_video_list_art(self, video_list, include_refs=False, art_only=False):
+        if not getattr(video_list, 'videos', None):
+            return video_list
+        pending = []
+        for video in video_list.videos.values():
+            if not isinstance(video, dict):
+                continue
+            needs_art = self._needs_metadata_boxart(video)
+            needs_refs = include_refs and not _has_reference_entries(video, 'cast')
+            needs_year = (not art_only and
+                          not common.get_path_safe(['releaseYear', 'value'], video))
+            needs_synopsis = (not art_only and
+                              not (common.get_path_safe(['synopsis', 'value'], video) or
+                                   common.get_path_safe(['regularSynopsis', 'value'], video)))
+            if not needs_art and not needs_refs and not needs_year and not needs_synopsis:
+                continue
+            try:
+                videoid = VideoId.from_videolist_item(video)
+            except Exception:  # pylint: disable=broad-except
+                continue
+            if videoid.mediatype not in (VideoId.MOVIE, VideoId.SHOW):
+                continue
+            pending.append((videoid, video, needs_art, needs_refs, needs_year, needs_synopsis))
+        if not pending:
+            return video_list
+
+        cast_metadata_by_video = self.req_title_cast_metadata_batch(
+            item[0].value for item in pending if item[3])
+
+        metadata_request = None
+        if any(item[2] or item[4] or item[5] for item in pending):
+            try:
+                metadata_request = self._prepare_metadata_request()
+            except Exception as exc:  # pylint: disable=broad-except
+                LOG.debug('List metadata request setup failed ({})', type(exc).__name__)
+
+        def _load_metadata(item):
+            videoid, _video, needs_art, needs_refs, needs_year, needs_synopsis = item
+            try:
+                metadata = (self._metadata_for_video_from_request(videoid.value, metadata_request)
+                            if metadata_request and (needs_art or needs_year or needs_synopsis) else {})
+            except Exception as exc:  # pylint: disable=broad-except
+                LOG.debug('Metadata enrichment skipped for {}: {}', videoid, exc)
+                metadata = {}
+            cast_metadata = cast_metadata_by_video.get(str(videoid.value), {})
+            if needs_refs and _metadata_has_cast_names(cast_metadata):
+                metadata = dict(metadata)
+                metadata['actors'] = cast_metadata['actors']
+            if (not art_only and
+                    ((needs_refs and not _metadata_has_cast_names(metadata)) or
+                     (needs_year and not _metadata_year(metadata)) or
+                     (needs_synopsis and not self._metadata_synopsis(metadata)))):
+                metadata = metadata_with_title_page_fallback(videoid.value, metadata)
+            return item, metadata
+
+        max_workers = min(12 if art_only else 6, len(pending))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_load_metadata, item) for item in pending]
+            for future in as_completed(futures):
+                try:
+                    item, metadata = future.result()
+                except Exception as exc:  # pylint: disable=broad-except
+                    LOG.debug('Metadata enrichment worker failed ({})', type(exc).__name__)
+                    continue
+                videoid, video, needs_art, needs_refs, needs_year, needs_synopsis = item
+                if needs_art:
+                    self._apply_metadata_art(video, metadata)
+                if needs_synopsis:
+                    self._apply_metadata_synopsis(video, metadata)
+                if needs_year:
+                    release_year = _metadata_year(metadata)
+                    if release_year:
+                        video['releaseYear'] = {'value': release_year}
+                if needs_refs:
+                    normalize_metadata_references(video_list.data, videoid.value, metadata, video)
+        video_list.artitem = next(iter(video_list.videos.values()), None)
+        return video_list
+
+    @staticmethod
+    def _needs_metadata_boxart(video):
+        poster = common.get_path_safe(['boxarts', ART_SIZE_POSTER, 'jpg', 'value', 'url'], video)
+        browser_boxart = common.get_path_safe(
+            ['itemSummary', 'value', 'boxArt', 'url'], video)
+        # Netflix browser rows can label a landscape carousel image as boxArt,
+        # including dimensions that claim it is portrait. Only metadata boxart
+        # is reliable enough to use as a Kodi poster.
+        return not poster or poster == browser_boxart
+
+    @staticmethod
+    def _apply_metadata_art(video, metadata):
+        boxart = DirectoryBuilder._best_metadata_art(
+            metadata, ('boxart', 'boxArt', 'boxarts'), portrait=True)
+        if boxart:
+            video.setdefault('boxarts', {})[ART_SIZE_POSTER] = {'jpg': {'value': {'url': boxart}}}
+        wide_art = DirectoryBuilder._best_metadata_art(
+            metadata, ('artwork', 'interestingMoment', 'storyart', 'storyArt'), portrait=False)
+        if wide_art:
+            video.setdefault('interestingMoment', {})[ART_SIZE_FHD] = {'jpg': {'value': {'url': wide_art}}}
+
+    @staticmethod
+    def _metadata_synopsis(metadata):
+        if not isinstance(metadata, dict):
+            return ''
+        return metadata.get('synopsis') or metadata.get('regularSynopsis') or ''
+
+    @staticmethod
+    def _apply_metadata_synopsis(video, metadata):
+        synopsis = DirectoryBuilder._metadata_synopsis(metadata)
+        if synopsis:
+            video['synopsis'] = {'value': synopsis}
+            video['regularSynopsis'] = {'value': synopsis}
+
+    @staticmethod
+    def _best_metadata_art(metadata, keys, portrait):
+        return _metadata_image_url(metadata, keys, portrait)
+
+    def _filter_unavailable_videos(self, video_list):
+        videos_type = type(video_list.videos)
+        playable_videos = videos_type(
+            (video_id, video)
+            for video_id, video in video_list.videos.items()
+            if video.get('availability', {}).get('value', {}).get('isPlayable', False))
+        if len(playable_videos) == len(video_list.videos):
+            return video_list
+        video_list.videos = playable_videos
+        video_list.artitem = next(iter(playable_videos.values()), None)
+        video_list.contained_titles = [
+            video.get('title', {}).get('value')
+            for video in playable_videos.values()
+            if video.get('title', {}).get('value')]
+        return video_list
+
+    def _video_list_from_lolomo_category_context(self, category_name, contexts, fallback_first=False):
+        if isinstance(contexts, str):
+            contexts = (contexts,)
+        try:
+            return self._lolomo_category_context_video_list(category_name, contexts, fallback_first)
+        except InvalidVideoListTypeError:
+            # The cached category response can hold expired session-scoped list ids (NES_..._p_<timestamp>)
+            # that a fresh 'by id' request no longer knows, refresh the category data and retry once
+            LOG.warn('LoLoMo category "{}" list resolution failed, retrying with fresh category data',
+                     category_name)
+            G.CACHE.delete(CACHE_COMMON, f'lolomo_category_{category_name}')
+            return self._lolomo_category_context_video_list(category_name, contexts, fallback_first)
+
+    def _lolomo_category_context_video_list(self, category_name, contexts, fallback_first):
+        first_list_id = None
+        for list_id, summary, video_list in self.req_lolomo_category(category_name=category_name).lists():
+            if not first_list_id and video_list.videos:
+                first_list_id = list_id
+            if summary.get('context') in contexts:
+                return self._browser_lolomo_video_list_by_id(category_name, list_id)
+        if fallback_first and first_list_id:
+            return self._browser_lolomo_video_list_by_id(category_name, first_list_id)
+        raise InvalidVideoListTypeError(f'No LoLoMo category list with context {contexts} available')
+
+    def _video_list_from_genre_context(self, genre_id, contexts):
+        if isinstance(contexts, str):
+            contexts = (contexts,)
+        try:
+            loco_list = self.req_loco_list_genre(genre_id)
+            for list_id, video_list in loco_list.lists.items():
+                if video_list.get('context') in contexts:
+                    try:
+                        return self._browser_genre_video_list_by_id(genre_id, list_id)
+                    except Exception as exc:  # pylint: disable=broad-except
+                        LOG.warn('Using materialized genre row {} after list lookup failed: {}', list_id, exc)
+                        return video_list
+        except Exception as exc:  # pylint: disable=broad-except
+            LOG.warn('Continue Watching genre fallback failed: {}', exc)
+        return CustomVideoList({'videos': {}})
+
     @measure_exec_time_decorator(is_immediate=True)
-    def get_video_list_sorted_sp(self, pathitems, menu_data, context_name, context_id, perpetual_range_start):
+    def get_video_list_sorted_sp(self, path_items, menu_data, context_name, context_id, perpetual_range_start):
         # Method used for the menu search
         video_list = self.req_videos_list_sorted(context_name,
                                                  context_id=context_id,
                                                  perpetual_range_start=perpetual_range_start,
                                                  menu_data=menu_data)
-        return build_video_listing(video_list, menu_data, None, pathitems, perpetual_range_start,
+        return build_video_listing(video_list, menu_data, None, path_items, perpetual_range_start,
                                    self.req_mylist_items())
 
     @measure_exec_time_decorator(is_immediate=True)
     def get_category_list(self, menu_data):
-        lolomo_category_list = self.req_lolomo_category(menu_data['loco_contexts'][0])
+        lolomo_category_list = self.req_lolomo_category(category_name=menu_data['loco_contexts'][0])
         return build_lolomo_category_listing(lolomo_category_list, menu_data)
 
     @measure_exec_time_decorator(is_immediate=True)
     def get_video_list_supplemental(self, menu_data, video_id_dict, supplemental_type):
         video_list = self.req_video_list_supplemental(VideoId.from_dict(video_id_dict),
                                                       supplemental_type=supplemental_type)
+        return build_video_listing(video_list, menu_data, mylist_items=[])
+
+    @measure_exec_time_decorator(is_immediate=True)
+    def get_similar_video_list(self, menu_data, video_id_dict):
+        video_list = self.req_similar_video_list(videoid=VideoId.from_dict(video_id_dict))
         return build_video_listing(video_list, menu_data, mylist_items=[])
 
     @measure_exec_time_decorator(is_immediate=True)
@@ -131,18 +408,42 @@ class DirectoryBuilder(DirectoryPathRequests):
     @measure_exec_time_decorator(is_immediate=True)
     def get_video_list_search(self, pathitems, menu_data, search_term, perpetual_range_start, path_params=None):
         video_list = self.req_video_list_search(search_term, perpetual_range_start=perpetual_range_start)
+        # Search already uses browser GraphQL result art. Extra metadata/My List lookups can exceed the IPC timeout.
         return build_video_listing(video_list, menu_data,
-                                   pathitems=pathitems, mylist_items=self.req_mylist_items(), path_params=path_params)
+                                   pathitems=pathitems, mylist_items=[], path_params=path_params)
 
     @measure_exec_time_decorator(is_immediate=True)
     def get_genres(self, menu_data, genre_id, force_use_videolist_id):
+        if not menu_data:
+            # A client with a stale path can send None (e.g. widget of a menu that no longer exists)
+            raise InvalidPathError('The requested menu is no longer available. '
+                                   'If used by a widget/favourite/shortcut, remove and add it again.')
         if genre_id:
             # Load the LoCo list of the specified genre
             loco_list = self.req_loco_list_genre(genre_id)
+            if menu_data['path'][1] in ('tvshows', 'movies'):
+                menu_data = dict(menu_data)
+                menu_data['loco_contexts'] = None
+                force_use_videolist_id = True
+        elif menu_data['path'][1] == 'recommendations':
+            return build_lolomo_category_listing(self.req_lolomo_category(category_name='comingSoon'), menu_data)
         else:
             # Load the LoCo root list filtered by 'loco_contexts' specified in the menu_data
             loco_list = self.req_loco_list_root()
         return build_loco_listing(loco_list, menu_data, force_use_videolist_id)
+
+    @measure_exec_time_decorator(is_immediate=True)
+    def get_collections(self, menu_data, search_term):
+        collections = self.req_search_suggestion_collections(search_term=search_term)
+        return build_collections_listing(collections, menu_data)
+
+    @measure_exec_time_decorator(is_immediate=True)
+    def get_collection_video_list(self, menu_data, collection_id, collection_name, search_term,
+                                  pathitems):
+        video_list = self.req_search_entity_video_list(entity_id=collection_id,
+                                                       display_string=collection_name,
+                                                       query_string=search_term)
+        return build_video_listing(video_list, menu_data, pathitems=pathitems, mylist_items=[])
 
     @measure_exec_time_decorator(is_immediate=True)
     def get_subgenres(self, menu_data, genre_id):
@@ -166,7 +467,11 @@ class DirectoryBuilder(DirectoryPathRequests):
         """Add the specified video ids to a video list datatype in the cache (only if the cache item exists)"""
         try:
             video_list_sorted_data = G.CACHE.get(cache_bucket, cache_identifier)
-            merge_data_type(video_list_sorted_data, self.req_datatype_video_list_byid(video_ids))
+            data_to_merge = self.req_datatype_video_list_byid(video_ids)
+            for video in data_to_merge.videos.values():
+                video.setdefault('queue', {'value': {}})
+                video['queue'].setdefault('value', {})['inQueue'] = True
+            merge_data_type(video_list_sorted_data, data_to_merge)
             G.CACHE.add(cache_bucket, cache_identifier, video_list_sorted_data)
         except CacheMiss:
             pass
@@ -178,6 +483,12 @@ class DirectoryBuilder(DirectoryPathRequests):
         :param video_id: videoid as [string] value
         :return: a tuple ([bool] true if videoid exists, [string] the current list id, that depends from loco id)
         """
-        list_id = self.get_loco_list_id_by_context('continueWatching')
-        video_list = self.req_video_list(list_id).videos if video_id else []
+        try:
+            list_id = self.get_loco_list_id_by_context('continueWatching')
+            video_list = self.req_video_list(list_id).videos if video_id else []
+        except Exception as exc:  # pylint: disable=broad-except
+            _ = exc  # Silence IDE warning, code is intentionally ignoring all exceptions here
+            current_list = self._video_list_from_genre_context('1592210', ('continueWatching',))
+            list_id = current_list.videoid.value if getattr(current_list, 'videoid', None) else None
+            video_list = current_list.videos if video_id else []
         return video_id in video_list, list_id

@@ -49,6 +49,10 @@ class SessionBase:
             'Accept-Encoding': 'gzip, deflate, br',
             'Host': 'www.netflix.com'
         })
+        # Netflix recognizes the TLS settings of python as a non browser client, and the pages
+        # that ask to confirm the identity refuse it, so keep the browser ones for the whole session
+        from resources.lib.services.nfsession.session.access import _mount_browser_tls
+        _mount_browser_tls(self.session)
         LOG.info('Initialized new session')
 
     @property

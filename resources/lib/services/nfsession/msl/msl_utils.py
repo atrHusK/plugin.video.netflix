@@ -43,7 +43,9 @@ MSL_DATA_FILENAME = 'msl_data.json'
 EVENT_START = 'start'      # events/start : Video starts
 EVENT_STOP = 'stop'        # events/stop : Video stops
 EVENT_KEEP_ALIVE = 'keepAlive'  # events/keepAlive : Update progress status
-EVENT_ENGAGE = 'engage'    # events/engage : After user interaction (before stop, on skip, on pause)
+EVENT_ENGAGE = 'engage'    # events/engage : After user interaction such as seeking
+EVENT_PAUSE = 'pause'      # events/pause : Video pauses
+EVENT_RESUME = 'resume'    # events/resume : Video resumes
 EVENT_BIND = 'bind'        # events/bind : ?
 
 AUDIO_CHANNELS_CONV = {1: '1.0', 2: '2.0', 6: '5.1', 8: '7.1'}
@@ -84,10 +86,13 @@ def is_media_changed(previous_player_state, player_state):
 
 def update_play_times_duration(play_times, player_state):
     """Update the playTimes duration values"""
-    duration = player_state['current_pts'] * 1000
+    duration = max(0, int(player_state['current_pts'] * 1000))
     play_times['total'] = duration
+    play_times['totalCombinedDuration'] = duration
     play_times['audio'][0]['duration'] = duration
     play_times['video'][0]['duration'] = duration
+    play_times.setdefault('text', [])
+    play_times.setdefault('programs', {})
 
 
 def build_media_tag(player_state, manifest, position):
@@ -97,9 +102,10 @@ def build_media_tag(player_state, manifest, position):
     audio_downloadable_id, audio_track_id = _find_audio_data(player_state, manifest)
     video_downloadable_id, video_track_id = _find_video_data(player_state, manifest)
     text_track_id = _find_subtitle_data(manifest)
-    duration = position - 1  # 22//11/2021 The duration has the subtracted value of 1
+    duration = max(0, int(position))
     play_times = {
         'total': duration,
+        'totalCombinedDuration': duration,
         'audio': [{
             'downloadableId': audio_downloadable_id,
             'duration': duration
@@ -108,7 +114,8 @@ def build_media_tag(player_state, manifest, position):
             'downloadableId': video_downloadable_id,
             'duration': duration
         }],
-        'text': []
+        'text': [],
+        'programs': {}
     }
     return play_times, video_track_id, audio_track_id, text_track_id
 

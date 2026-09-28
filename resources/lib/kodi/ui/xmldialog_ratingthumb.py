@@ -28,6 +28,7 @@ class RatingThumb(xbmcgui.WindowXMLDialog):
         # 0 = No rated
         # 1 = thumb down
         # 2 = thumb up
+        # 3 = loved (the thumb up twice of the website)
         self.action_exit_keys_id = [ACTION_PREVIOUS_MENU,
                                     ACTION_PLAYER_STOP,
                                     ACTION_NAV_BACK]
@@ -40,9 +41,15 @@ class RatingThumb(xbmcgui.WindowXMLDialog):
         # so the only alternative is to create double XML buttons
         # and eliminate those that are not needed
         focus_id = 10010
-        if self.user_rating == 0:  # No rated
+        import resources.lib.common as common
+        # The love button keeps one control, its label says what pressing it does
+        self.getControl(10030).setLabel(common.get_local_string(30753 if self.user_rating == 3
+                                                               else 30752))
+        if self.user_rating in (0, 3):  # No rated, or loved
             self.removeControl(self.getControl(10012))
             self.removeControl(self.getControl(10022))
+            if self.user_rating == 3:
+                focus_id = 10030
         if self.user_rating == 1:  # Thumb down set
             self.removeControl(self.getControl(10012))
             self.removeControl(self.getControl(10020))
@@ -56,11 +63,20 @@ class RatingThumb(xbmcgui.WindowXMLDialog):
         self.setFocusId(focus_id)
 
     def onClick(self, controlId):
-        if controlId in [10010, 10020, 10012, 10022]:  # Rating and close
-            rating_map = {10010: 2, 10020: 1, 10012: 0, 10022: 0}
+        if controlId in [10010, 10020, 10012, 10022, 10030]:  # Rating and close
+            rating_map = {10010: 2, 10020: 1, 10012: 0, 10022: 0,
+                          10030: 0 if self.user_rating == 3 else 3}
             rating_value = rating_map[controlId]
+            from resources.lib.utils.logging import LOG
+            LOG.info('RATE THUMB: the button {} was pressed, rating the video as {}',
+                     controlId, rating_value)
             from resources.lib.utils.api_requests import rate_thumb
-            rate_thumb(self.videoid, rating_value, self.track_id_jaw)
+            try:
+                rate_thumb(self.videoid, rating_value, self.track_id_jaw)
+            except Exception as exc:  # pylint: disable=broad-except
+                LOG.error('RATE THUMB: the rating failed ({}: {})', type(exc).__name__, exc)
+                import resources.lib.kodi.ui as ui
+                ui.show_addon_error_info(exc)
             self.close()
         if controlId in [10040, 100]:  # Close
             self.close()

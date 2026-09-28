@@ -26,11 +26,12 @@ from resources.lib.utils.logging import LOG, measure_exec_time_decorator
 # To add a new type: add the new type name to SEARCH_TYPES, then implement the new type to search_add/search_query.
 
 
-SEARCH_TYPES = ['text', 'audio_lang', 'subtitles_lang', 'genre_id']
+SEARCH_TYPES = ['text', 'audio_lang', 'subtitles_lang', 'dubbed_lang', 'genre_id']
 SEARCH_TYPES_DESC = {
     'text': common.get_local_string(30410),
     'audio_lang': common.get_local_string(30411),
     'subtitles_lang': common.get_local_string(30412),
+    'dubbed_lang': common.get_local_string(30414),
     'genre_id': common.get_local_string(30413)
 }
 
@@ -95,24 +96,18 @@ def search_add():
         row_id = _search_add_bylang(SEARCH_TYPES[type_index], api.get_available_audio_languages())
     elif search_type == 'subtitles_lang':
         row_id = _search_add_bylang(SEARCH_TYPES[type_index], api.get_available_subtitles_languages())
+    elif search_type == 'dubbed_lang':
+        row_id = _search_add_bylang(SEARCH_TYPES[type_index], api.get_available_dubbed_languages())
     elif search_type == 'genre_id':
         genre_id = ui.show_dlg_input_numeric(search_types_desc[type_index], mask_input=False)
         if genre_id:
             row_id = _search_add_bygenreid(SEARCH_TYPES[type_index], genre_id)
     else:
         raise NotImplementedError(f'Search type index {type_index} not implemented')
-    # Redirect to "search" endpoint (otherwise no results in JSON-RPC)
-    # Rewrite path history using dir_update_listing + container_update
-    # (otherwise will retrigger input dialog on Back or Container.Refresh)
-    if row_id is not None and search_query(row_id, 0, False):
-        url = common.build_url(['search', 'search', row_id], mode=G.MODE_DIRECTORY, params={'dir_update_listing': True})
-        from time import sleep
-        # The forced sleep its needed because seem that change the container path too fast
-        # make problems in Kodi core and the GUI fails to update, when this happens cause side effects to context menus
-        # like "add/remove from my list" that when used ask again to make a new search because re-open the initial path
-        sleep(1)
-        common.container_update(url, False)
-        return True
+    # Replace the current listing synchronously. An asynchronous Container.Update
+    # races the still-open /add directory and Kodi can discard the results.
+    if row_id is not None:
+        return search_query(str(row_id), 0, True)
     return False
 
 
@@ -210,7 +205,7 @@ def exec_query(row_id, search_type, search_params, search_value, perpetual_range
             'context_id': common.convert_from_string(search_params, dict)['lang_code']
         }
         dir_items, extra_data = common.make_call('get_video_list_sorted_sp', call_args)
-    elif search_type == 'subtitles_lang':
+    elif search_type in ('subtitles_lang', 'dubbed_lang'):
         call_args = {
             'menu_data': menu_data,
             'pathitems': ['search', 'search', row_id],

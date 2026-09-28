@@ -7,8 +7,11 @@
     SPDX-License-Identifier: MIT
     See LICENSES/MIT.md for more information.
 """
+from urllib.parse import unquote, urlparse
+
 import xbmc
 import xbmcgui
+import xbmcplugin
 
 import resources.lib.common as common
 import resources.lib.kodi.ui as ui
@@ -18,7 +21,7 @@ from resources.lib.common.cache_utils import CACHE_BOOKMARKS
 from resources.lib.common.exceptions import MissingCredentialsError, CacheMiss
 from resources.lib.globals import G
 from resources.lib.kodi.library import get_library_cls
-from resources.lib.utils.api_paths import VIDEO_LIST_RATING_THUMB_PATHS, SUPPLEMENTAL_TYPE_TRAILERS
+from resources.lib.utils.api_paths import SUPPLEMENTAL_TYPE_TRAILERS
 from resources.lib.utils.logging import LOG, measure_exec_time_decorator
 
 
@@ -65,37 +68,66 @@ class AddonActionExecutor:
             G.LOCAL_DB.set_profile_config('addon_pin', '', guid=self.params['profile_guid'])
         common.container_refresh()
 
+    def profile_lock(self, pathitems=None):  # pylint: disable=unused-argument
+        """Set or remove the PIN that locks a profile"""
+        guid = self.params['profile_guid']
+        if self.params.get('operation') == 'remove':
+            if not ui.ask_for_confirmation(common.get_local_string(30755),
+                                           common.get_local_string(30757)):
+                return
+            pin = ''
+        else:
+            pin = ui.ask_for_input(common.get_local_string(30756))
+            if not pin:
+                return
+            pin = pin.strip()
+            if not (pin.isdigit() and len(pin) == 4):
+                LOG.info('PROFILE LOCK: the typed PIN is not 4 digits')
+                ui.show_ok_dialog('Netflix', common.get_local_string(30758))
+                return
+        LOG.info('PROFILE LOCK: {} the lock of the profile {}',
+                 'setting' if pin else 'removing', guid)
+        try:
+            if pin:
+                api.set_profile_lock(guid, pin)
+            else:
+                api.remove_profile_lock(guid)
+        except MissingCredentialsError:
+            LOG.debug('The identity check was cancelled')
+            return
+        except Exception as exc:  # pylint: disable=broad-except
+            LOG.error('Unable to change the profile lock: {}', exc)
+            ui.show_addon_error_info(exc)
+            return
+        G.LOCAL_DB.set_profile_config('isPinLocked', bool(pin), guid=guid)
+        ui.show_notification(common.get_local_string(30759 if pin else 30760))
+        common.container_refresh()
+
     def parental_control(self, pathitems=None):  # pylint: disable=unused-argument
         """Open parental control settings dialog"""
-        password = ui.ask_for_password()
-        if not password:
-            return
+        # Netflix no longer asks the password here, it asks to confirm the identity with a code
         try:
-            parental_control_data = api.get_parental_control_data(self.params['profile_guid'],
-                                                                  password)
+            parental_control_data = api.get_parental_control_data(self.params['profile_guid'], None)
             ui.show_parental_dialog(**parental_control_data)
         except MissingCredentialsError:
-            ui.show_ok_dialog('Netflix', common.get_local_string(30009))
+            # The code prompt was closed without typing it, there is nothing to report
+            LOG.debug('The identity check was cancelled')
 
     @common.inject_video_id(path_offset=1)
     @measure_exec_time_decorator()
     def rate_thumb(self, videoid):
         """Rate an item on Netflix. Ask for a thumb rating"""
         # Get updated user rating info for this videoid
-        raw_data = api.get_video_raw_data([videoid], VIDEO_LIST_RATING_THUMB_PATHS)
-        if raw_data.get('videos', {}).get(videoid.value):
-            video_data = raw_data['videos'][videoid.value]
-            title = video_data.get('title', {}).get('value', '--')
-            # Is intended throw error when missing some dict data
-            track_id_jaw = video_data['trackIds']['value']['trackId_jaw']
-            is_thumb_rating = video_data['userRating'].get('value', {}).get('type') == 'thumb'
-            user_rating = video_data['userRating']['value']['userRating'] if is_thumb_rating else None
-            ui.show_rating_thumb_dialog(videoid=videoid,
-                                        title=title,
-                                        track_id_jaw=track_id_jaw,
-                                        user_rating=user_rating)
-        else:
-            LOG.warn('Rating thumb video list api request no got results for {}', videoid)
+        try:
+            rating_info = api.get_thumb_rating_info(videoid)
+        except Exception as exc:  # pylint: disable=broad-except
+            LOG.warn('Unable to read the thumb rating of {} ({})', videoid, type(exc).__name__)
+            ui.show_ok_dialog('Netflix', common.get_local_string(30045).split('|', maxsplit=1)[0])
+            return
+        ui.show_rating_thumb_dialog(videoid=videoid,
+                                    title=rating_info['title'],
+                                    track_id_jaw=None,
+                                    user_rating=rating_info['user_rating'])
 
     # Old rating system
     # @common.inject_video_id(path_offset=1)
@@ -114,9 +146,10 @@ class AddonActionExecutor:
         operation = pathitems[1]
         api.update_my_list(videoid, operation, self.params)
         sync_library(videoid, operation)
-        if operation == 'remove' and common.WndHomeProps[common.WndHomeProps.CURRENT_DIRECTORY_MENU_ID] == 'myList':
+        is_mylist = common.WndHomeProps[common.WndHomeProps.CURRENT_DIRECTORY_MENU_ID] == 'myList'
+        if operation == 'remove' and is_mylist:
             common.json_rpc('Input.Down')  # Avoids selection back to the top
-        common.container_refresh()
+            common.container_refresh()
 
     @common.inject_video_id(path_offset=1)
     def remind_me(self, videoid):
@@ -142,14 +175,85 @@ class AddonActionExecutor:
                                                      'video_id_dict': video_id_dict,
                                                      'supplemental_type': SUPPLEMENTAL_TYPE_TRAILERS
                                                  })
-        if list_data:
+        if list_data or self._direct_trailer_url(videoid):
             url = common.build_url(['supplemental'],
                                    params={'video_id_dict': dumps(video_id_dict),
                                            'supplemental_type': SUPPLEMENTAL_TYPE_TRAILERS},
                                    mode=G.MODE_DIRECTORY)
             common.container_update(url)
-        else:
-            ui.show_notification(common.get_local_string(30111))
+            return
+        ui.show_notification(common.get_local_string(30111))
+
+    @common.inject_video_id(path_offset=1)
+    @measure_exec_time_decorator()
+    def similar(self, videoid):
+        """Open the titles the website suggests next to this one"""
+        from json import dumps
+        url = common.build_url(['similar'],
+                               params={'video_id_dict': dumps(videoid.to_dict())},
+                               mode=G.MODE_DIRECTORY)
+        common.container_update(url)
+
+    @common.inject_video_id(path_offset=1)
+    @measure_exec_time_decorator()
+    def play_trailer(self, videoid):
+        """Resolve the first trailer for the Kodi info dialog trailer button."""
+        trailer_videoid = self._first_trailer_videoid(videoid)
+        if trailer_videoid:
+            from resources.lib.navigation.player import _play  # pylint: disable=protected-access,import-outside-toplevel
+            _play(trailer_videoid, False)
+            return
+        self._resolve_direct_trailer(videoid)
+
+    @common.inject_video_id(path_offset=1)
+    @measure_exec_time_decorator()
+    def play_direct_trailer(self, videoid):
+        """Resolve only the direct metadata trailer selected from the trailer menu."""
+        self._resolve_direct_trailer(videoid)
+
+    def _resolve_direct_trailer(self, videoid):
+        trailer_url = self._direct_trailer_url(videoid)
+        if trailer_url:
+            title = xbmc.getInfoLabel('ListItem.Title') or xbmc.getInfoLabel('ListItem.Label')
+            list_item = xbmcgui.ListItem(title, path=trailer_url, offscreen=True)
+            if title:
+                list_item.setInfo('video', {'Title': title})
+            list_item.setProperty('isPlayable', 'true')
+            list_item.setContentLookup(False)
+            xbmcplugin.setResolvedUrl(handle=G.PLUGIN_HANDLE, succeeded=True, listitem=list_item)
+            return True
+        xbmcplugin.setResolvedUrl(handle=G.PLUGIN_HANDLE, succeeded=False, listitem=xbmcgui.ListItem())
+        return False
+
+    @staticmethod
+    def _first_trailer_videoid(videoid):
+        menu_data = {'path': ['is_context_menu_item', 'is_context_menu_item'],
+                     'title': common.get_local_string(30179)}
+        list_data, _extra_data = common.make_call('get_video_list_supplemental',
+                                                  {
+                                                      'menu_data': menu_data,
+                                                      'video_id_dict': videoid.to_dict(),
+                                                      'supplemental_type': SUPPLEMENTAL_TYPE_TRAILERS
+                                                  })
+        for url, list_item, is_folder in list_data or []:
+            if is_folder:
+                continue
+            videoid_path = list_item.getProperty('nf_videoid')
+            if videoid_path:
+                return common.VideoId.from_path(videoid_path.split('/'))
+            parsed_path = _plugin_pathitems(url)
+            if parsed_path[:1] == [G.MODE_PLAY]:
+                return common.VideoId.from_path(parsed_path[1:])
+        return None
+
+    @staticmethod
+    def _direct_trailer_url(videoid):
+        try:
+            direct_trailer = common.make_call('get_direct_trailer', videoid) or {}
+        except Exception as exc:  # pylint: disable=broad-except
+            LOG.warn('Trailer info lookup failed for {}: {}', videoid, exc)
+            return ''
+        return direct_trailer.get('url', '')
 
     @measure_exec_time_decorator()
     def purge_cache(self, pathitems=None):  # pylint: disable=unused-argument
@@ -293,3 +397,8 @@ def change_watched_status_locally(videoid):
         G.SHARED_DB.set_watched_status(profile_guid, videoid.value, True)
     ui.show_notification(common.get_local_string(30237).split('|')[txt_index])
     common.container_refresh()
+
+
+def _plugin_pathitems(url):
+    path = unquote(urlparse(url).path).strip('/')
+    return [part for part in path.split('/') if part]

@@ -87,8 +87,13 @@ def extract_session_data(content, validate=False, update_profiles=False):
         parse_profiles(falcor_cache)
     # Save only some info of the current profile from user data
     G.LOCAL_DB.set_value('build_identifier', user_data.get('BUILD_IDENTIFIER'), TABLE_SESSION)
-    if not get_website_esn():
+    # The website ESN depends on the user agent, e.g. it change when the Widevine CDM switch from Chrome OS to Linux
+    user_agent = common.get_user_agent()
+    if not get_website_esn() or G.LOCAL_DB.get_value('website_esn_ua', '', TABLE_SESSION) != user_agent:
+        if get_website_esn() and G.LOCAL_DB.get_value('esn_auto_generate', True):
+            G.LOCAL_DB.set_value('esn', '', TABLE_SESSION)  # Force a new ESN based on the new website ESN
         set_website_esn(user_data['esn'])
+        G.LOCAL_DB.set_value('website_esn_ua', user_agent, TABLE_SESSION)
     pref_locale = user_data.get('preferredLocale', {}).get('id')
     if pref_locale:
         G.LOCAL_DB.set_value('locale_id', pref_locale)
@@ -163,6 +168,39 @@ def parse_profiles(data):
         LOG.error(traceback.format_exc())
         LOG.error('Profile list data: {}', profiles_list)
         raise InvalidProfilesError from exc
+
+
+def parse_profiles_summary(data):
+    """Parse the profiles from the GraphQL summary the website uses"""
+    profiles = common.get_path_safe(['data', 'account', 'profiles'], data, False, None)
+    if not profiles:
+        raise InvalidProfilesError('It has not been possible to obtain the list of profiles.')
+    # The summary does not say which profile is the current one, keep the one already active
+    active_guid = G.LOCAL_DB.get_active_profile_guid()
+    current_guids = []
+    for sort_order, profile in enumerate(profiles):
+        guid = profile.get('guid')
+        if not guid:
+            continue
+        current_guids.append(guid)
+        LOG.debug('Parsing profile {}', guid)
+        language = profile.get('primaryLanguage') or 'en-US'
+        summary = {
+            'profileName': parse_html(profile.get('name') or ''),
+            'avatar': common.get_path_safe(['icon', 'image', 'url'], profile, False, G.ICON) or G.ICON,
+            'isAccountOwner': bool(profile.get('isAccountOwner')),
+            'isKids': bool(profile.get('isKids')),
+            'isPinLocked': bool(profile.get('isPinLocked')),
+            'maturityLevel': common.get_path_safe(['maturityRating', 'level'], profile, False, 1000000),
+            'language': language,
+            'language_desc': xbmc.convertLanguage(language[:2], xbmc.ENGLISH_NAME)
+        }
+        G.LOCAL_DB.set_profile(guid, guid == active_guid, sort_order)
+        G.SHARED_DB.set_profile(guid, sort_order)
+        G.LOCAL_DB.insert_profile_configs(summary, guid)
+    if not current_guids:
+        raise InvalidProfilesError('It has not been possible to obtain the list of profiles.')
+    _delete_non_existing_profiles(current_guids)
 
 
 def _delete_non_existing_profiles(current_guids):
@@ -278,6 +316,72 @@ def validate_login(react_context):
             raise WebsiteParsingError(error_msg) from exc
 
 
+def decode_javascript_string(value):
+    """Decode a JavaScript string literal without corrupting decoded Unicode."""
+    decoded = []
+    index = 0
+    value_length = len(value)
+    simple_escapes = {
+        "'": "'", '"': '"', '\\': '\\', '/': '/',
+        'b': '\b', 'f': '\f', 'n': '\n', 'r': '\r', 't': '\t', 'v': '\v', '0': '\0'
+    }
+    while index < value_length:
+        character = value[index]
+        if character != '\\':
+            decoded.append(character)
+            index += 1
+            continue
+        index += 1
+        if index >= value_length:
+            decoded.append('\\')
+            break
+        escape = value[index]
+        if escape == 'u' and index + 4 < value_length:
+            hex_value = value[index + 1:index + 5]
+            try:
+                codepoint = int(hex_value, 16)
+            except ValueError:
+                pass
+            else:
+                index += 5
+                if (0xD800 <= codepoint <= 0xDBFF and
+                        index + 5 < value_length and value[index:index + 2] == '\\u'):
+                    low_hex_value = value[index + 2:index + 6]
+                    try:
+                        low_codepoint = int(low_hex_value, 16)
+                    except ValueError:
+                        pass
+                    else:
+                        if 0xDC00 <= low_codepoint <= 0xDFFF:
+                            codepoint = 0x10000 + ((codepoint - 0xD800) << 10) + (low_codepoint - 0xDC00)
+                            index += 6
+                decoded.append(chr(codepoint))
+                continue
+        elif escape == 'x' and index + 2 < value_length:
+            hex_value = value[index + 1:index + 3]
+            try:
+                decoded.append(chr(int(hex_value, 16)))
+                index += 3
+                continue
+            except ValueError:
+                pass
+        elif escape in simple_escapes:
+            decoded.append(simple_escapes[escape])
+            index += 1
+            continue
+        elif escape == '\n':
+            index += 1
+            continue
+        elif escape == '\r':
+            index += 1
+            if index < value_length and value[index] == '\n':
+                index += 1
+            continue
+        decoded.append(escape)
+        index += 1
+    return ''.join(decoded)
+
+
 @measure_exec_time_decorator(is_immediate=True)
 def extract_json(content, name):
     """Extract json from netflix content page"""
@@ -292,7 +396,7 @@ def extract_json(content, name):
         json_str_replace = json_str_replace.replace(r'\n', r'\\n')  # Escape line feed
         json_str_replace = json_str_replace.replace(r'\t', r'\\t')  # Escape tab
         json_str_replace = json_str_replace.replace(r'\p', r'/p')  # Unicode property not supported, we change slash to avoid unescape it
-        json_str_replace = json_str_replace.encode().decode('unicode_escape')  # Decode the string as unicode
+        json_str_replace = decode_javascript_string(json_str_replace)
         json_str_replace = sub(r'\\(?!["])', r'\\\\', json_str_replace)  # Escape backslash (only when is not followed by double quotation marks \")
         return json.loads(json_str_replace)
     except Exception as exc:  # pylint: disable=broad-except
@@ -302,6 +406,66 @@ def extract_json(content, name):
         import traceback
         LOG.error(traceback.format_exc())
         raise WebsiteParsingError(f'Unable to extract {name}') from exc
+
+
+PC_MATURITY_ITEM_RE = recompile(r'data-uia="action-select-maturity-(\d+)"(.*?)(?=data-uia="action-select-maturity-|\Z)',
+                                DOTALL)
+PC_MATURITY_LABEL_RE = recompile(r'class="pin-rating-item"[^>]*>([^<]+)<')
+PC_MATURITY_TOOLTIP_RE = recompile(r'data-tooltip="([^"]*)"')
+PC_MATURITY_CHECKED_RE = recompile(r'data-uia="maturity-(\d+)-radio"\s+checked')
+
+
+def extract_auth_url(content):
+    """Extract the authURL from the page, it is required to send data to Netflix"""
+    html = content.decode('utf-8', 'replace') if isinstance(content, bytes) else str(content)
+    match = search(r'"authURL":"([^"]+)"', html)
+    if not match:
+        raise WebsiteParsingError('Unable to get the authURL of the page')
+    return decode_javascript_string(match.group(1))
+
+
+def extract_parental_control_page_data(content, guid):
+    """Extract the content of parental control data from the restrictions page"""
+    html = content.decode('utf-8', 'replace') if isinstance(content, bytes) else str(content)
+    rating_levels = []
+    current_level_index = 0
+    for index, match in enumerate(PC_MATURITY_ITEM_RE.finditer(html)):
+        value = int(match.group(1))
+        block = match.group(2)
+        labels = PC_MATURITY_LABEL_RE.findall(block)
+        tooltips = PC_MATURITY_TOOLTIP_RE.findall(block)
+        rating_levels.append({
+            'level': index,
+            'value': value,
+            'label': parse_html(labels[0]) if labels else str(value),
+            'description': parse_html(tooltips[0]) if tooltips else ''
+        })
+    if not rating_levels:
+        raise WebsiteParsingError('Unable to get maturity rating levels')
+    checked = PC_MATURITY_CHECKED_RE.search(html)
+    current_maturity = int(checked.group(1)) if checked else rating_levels[-1]['value']
+    for rating_level in rating_levels:
+        if rating_level['value'] == current_maturity:
+            current_level_index = rating_level['level']
+    profile = _extract_parental_control_profile(html, guid)
+    profile['maturity'] = current_maturity
+    return {'rating_levels': rating_levels,
+            'current_level_index': current_level_index,
+            'data': profile}
+
+
+def _extract_parental_control_profile(html, guid):
+    """Extract the data of the profile the restrictions page was requested for"""
+    match = search(r'"experience":"(\w+)","firstName":"((?:[^"\\]|\\.)*)","guid":"' + guid + '"', html)
+    experience = match.group(1) if match else 'standard'
+    profile_name = decode_javascript_string(match.group(2)) if match else ''
+    locked = search(r'"guid":"' + guid + r'"[^{]*?"isProfileLocked":(true|false)', html)
+    return {
+        # The page and the save request do not use the same words for the experience
+        'experience': 'just_for_kids' if experience == 'just_for_kids' else 'regular',
+        'isPinLocked': bool(locked and locked.group(1) == 'true'),
+        'profileInfo': {'guid': guid, 'profileName': parse_html(profile_name)}
+    }
 
 
 def extract_parental_control_data(content, current_maturity):

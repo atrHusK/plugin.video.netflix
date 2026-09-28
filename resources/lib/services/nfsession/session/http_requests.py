@@ -23,11 +23,29 @@ from resources.lib.kodi import ui
 from resources.lib.services.nfsession.session.base import SessionBase
 from resources.lib.services.nfsession.session.endpoints import ENDPOINTS, BASE_URL
 from resources.lib.utils import cookies
+from resources.lib.utils.esn import get_website_esn
 from resources.lib.utils.logging import LOG, measure_exec_time_decorator
+
+
+GRAPHQL_URL = 'https://web.prod.cloud.netflix.com/graphql'
+# The account and identity operations are served by the website address
+ACCOUNT_GRAPHQL_URL = 'https://www.netflix.com/graphql'
+
+# Endpoints removed by Netflix, refreshing the session cannot make them work again
+# and would wrongly invalidate the stored credentials
+RETIRED_ENDPOINTS = ['profile_hub']
+
+# Netflix has retired several pathEvaluator paths, their 404 is not caused by an expired session,
+# refreshing it again for every request only slows down the navigation
+SESSION_REFRESH_MIN_INTERVAL_SECS = 60
 
 
 class SessionHTTPRequests(SessionBase):
     """Manages the HTTP requests"""
+
+    def __init__(self):
+        super().__init__()
+        self._last_session_refresh = None
 
     def get(self, endpoint, **kwargs):
         """Execute a GET request to the designated endpoint."""
@@ -42,6 +60,37 @@ class SessionHTTPRequests(SessionBase):
             method='POST',
             endpoint=endpoint,
             **kwargs)
+
+    @measure_exec_time_decorator(is_immediate=True)
+    def post_graphql(self, operation_name, variables, operation_id, referer=None, url=None,
+                     extra_headers=None):
+        """Execute a persisted GraphQL request against the website GraphQL gateway.
+
+        Netflix has two gateways: the content one is the default, the account and identity
+        operations are served by the website address instead.
+        """
+        self.assert_logged_in()
+        payload = {
+            'operationName': operation_name,
+            'variables': variables,
+            'extensions': {'persistedQuery': {'id': operation_id, 'version': 102}}
+        }
+        LOG.debug('Executing GraphQL request: {}', operation_name)
+        start = time.perf_counter()
+        headers = _graphql_headers(referer)
+        headers.update(extra_headers or {})
+        response = self.session.post(
+            url=url or GRAPHQL_URL,
+            json=payload,
+            headers=headers,
+            timeout=8)
+        LOG.debug('Request took {}s', time.perf_counter() - start)
+        LOG.debug('Request returned status code {}', response.status_code)
+        response.raise_for_status()
+        decoded_response = response.json() if response.content else {}
+        if decoded_response.get('errors'):
+            raise APIError(decoded_response['errors'][0].get('message'))
+        return decoded_response
 
     @measure_exec_time_decorator(is_immediate=True)
     def _request_call(self, method, endpoint, **kwargs):
@@ -101,10 +150,16 @@ class SessionHTTPRequests(SessionBase):
             # Error 401: This is a generic error, can happen when the http request for some reason has failed,
             #   we allow the refresh only for shakti endpoint, sometimes for unknown reasons it is necessary to update
             #   the session for the request to be successful
-            if response.status_code == 404 or (response.status_code == 401 and endpoint == 'shakti'):
-                LOG.warn('Attempt to refresh the session due to HTTP error {}', response.status_code)
-                if self.try_refresh_session_data():
-                    return self._request(method, endpoint, True, **kwargs)
+            if ((response.status_code == 404 and endpoint not in RETIRED_ENDPOINTS)
+                    or (response.status_code == 401 and endpoint == 'shakti')):
+                elapsed = time.monotonic() - getattr(self, '_last_session_refresh', 0)
+                if elapsed < SESSION_REFRESH_MIN_INTERVAL_SECS:
+                    LOG.debug('Session refreshed {}s ago, HTTP error {} is not caused by the session',
+                              int(elapsed), response.status_code)
+                else:
+                    LOG.warn('Attempt to refresh the session due to HTTP error {}', response.status_code)
+                    if self.try_refresh_session_data():
+                        return self._request(method, endpoint, True, **kwargs)
         if response.status_code == 401:
             raise HttpError401
         response.raise_for_status()
@@ -117,6 +172,7 @@ class SessionHTTPRequests(SessionBase):
         try:
             self.auth_url = website.extract_session_data(self.get('browse'))['auth_url']
             cookies.save(self.session.cookies)
+            self._last_session_refresh = time.monotonic()
             LOG.debug('Successfully refreshed session data')
             return True
         except MbrStatusError:
@@ -161,6 +217,8 @@ class SessionHTTPRequests(SessionBase):
             headers['x-netflix.request.client.user.guid'] = G.LOCAL_DB.get_active_profile_guid()
         if endpoint_conf.get('content_type'):
             headers['Content-Type'] = endpoint_conf['content_type']
+        if endpoint_conf['address'] == '/pathEvaluator':
+            _add_path_evaluator_headers(headers)
         headers.update(custom_headers)  # If needed override headers
         # Meanings parameters known:
         # drmSystem       DRM used
@@ -170,12 +228,12 @@ class SessionHTTPRequests(SessionBase):
         #                   it is still added in an 'empty' form in the response
         if endpoint_conf['use_default_params']:
             params = {
-                'webp': 'true',
+                'webp': 'false',
                 'drmSystem': 'widevine',
                 'isVolatileBillboardsEnabled': 'true',
                 'isTop10Supported': 'true',
-                'hasVideoMerchInBob': 'true',
-                'hasVideoMerchInJaw': 'true',
+                'hasVideoMerchInBob': 'false',
+                'hasVideoMerchInJaw': 'false',
                 'falcor_server': '0.1.0',
                 'withSize': 'true',
                 'materialize': 'true',
@@ -201,6 +259,8 @@ class SessionHTTPRequests(SessionBase):
                 data_converted += f'&{auth_data}' if data_converted else auth_data
         return data_converted, headers, params
 
+    def assert_logged_in(self):
+        pass
 
 def _document_url(endpoint_address, kwargs):
     if 'append_to_address' in kwargs:
@@ -211,6 +271,70 @@ def _document_url(endpoint_address, kwargs):
 def _api_url(endpoint_address):
     baseurl = G.LOCAL_DB.get_value('api_endpoint_url', table=TABLE_SESSION)
     return f'{baseurl}{endpoint_address}'
+
+
+def _add_path_evaluator_headers(headers):
+    """Add browser-equivalent metadata required by current website pathEvaluator requests."""
+    headers.update({
+        'Origin': BASE_URL,
+        'Referer': f'{BASE_URL}/browse',
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-origin',
+        'X-Netflix.browserName': 'Firefox',
+        'X-Netflix.clientType': 'akira',
+        'x-netflix.request.attempt': '1',
+        'x-netflix.request.client.context': 'www.netflix.com'
+    })
+    _set_header_if_value(
+        headers, 'X-Netflix.browserVersion',
+        G.LOCAL_DB.get_value('browser_info_version', '', table=TABLE_SESSION))
+    _set_header_if_value(
+        headers, 'X-Netflix.osName',
+        G.LOCAL_DB.get_value('browser_info_os_name', '', table=TABLE_SESSION))
+    _set_header_if_value(
+        headers, 'X-Netflix.osVersion',
+        G.LOCAL_DB.get_value('browser_info_os_version', '', table=TABLE_SESSION))
+    _set_header_if_value(
+        headers, 'X-Netflix.uiVersion',
+        G.LOCAL_DB.get_value('ui_version', '', table=TABLE_SESSION))
+    _set_header_if_value(
+        headers, 'x-netflix.request.id',
+        G.LOCAL_DB.get_value('request_id', '', table=TABLE_SESSION))
+    website_esn = get_website_esn()
+    if website_esn:
+        headers['X-Netflix.esn'] = website_esn
+        headers['X-Netflix.esnPrefix'] = website_esn.rsplit('-', 1)[0] if '-' in website_esn else website_esn
+
+
+def _graphql_headers(referer=None):
+    """Add browser-equivalent metadata required by current website GraphQL requests."""
+    headers = {
+        'Accept': '*/*',
+        'Content-Type': 'application/json',
+        'Origin': BASE_URL,
+        'Referer': referer or f'{BASE_URL}/browse',
+        'x-netflix.nq.stack': 'prod',
+        'x-netflix.request.client.user.guid': G.LOCAL_DB.get_active_profile_guid()
+    }
+    _set_header_if_value(
+        headers, 'X-Netflix.browserVersion',
+        G.LOCAL_DB.get_value('browser_info_version', '', table=TABLE_SESSION))
+    _set_header_if_value(
+        headers, 'X-Netflix.osName',
+        G.LOCAL_DB.get_value('browser_info_os_name', '', table=TABLE_SESSION))
+    _set_header_if_value(
+        headers, 'X-Netflix.osVersion',
+        G.LOCAL_DB.get_value('browser_info_os_version', '', table=TABLE_SESSION))
+    _set_header_if_value(
+        headers, 'X-Netflix.uiVersion',
+        G.LOCAL_DB.get_value('ui_version', '', table=TABLE_SESSION))
+    return headers
+
+
+def _set_header_if_value(headers, name, value):
+    if value:
+        headers[name] = value
 
 
 def _raise_api_error(decoded_response):

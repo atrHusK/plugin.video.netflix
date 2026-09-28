@@ -72,14 +72,22 @@ ENDPOINTS = {
          'add_auth_url': None,
          'accept': '*/*'},
     'switch_profile':
+    # The website switches the profile with the member api, the SwitchProfile address is the previous one
+        {'address': '/profiles/switch',
+         'is_api_call': True,
+         'use_default_params': False,
+         'add_auth_url': 'to_params',
+         'accept': '*/*'},
+    'switch_profile_legacy':
         {'address': '/SwitchProfile',
          'is_api_call': False,
          'use_default_params': False,
          'add_auth_url': None,
          'accept': '*/*'},
     'profile_lock':
-        {'address': '/api/shakti/mre/profileLock',
-         'is_api_call': False,
+    # The website asks the member api, the shakti address is the previous one
+        {'address': '/profileLock',
+         'is_api_call': True,
          'use_default_params': False,
          'add_auth_url': 'to_data',
          'content_type': 'application/json',

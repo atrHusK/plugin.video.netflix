@@ -53,6 +53,12 @@ def catch_exceptions_decorator(func):
         except ErrorMsgNoReport as exc:
             from resources.lib.kodi.ui import show_ok_dialog
             show_ok_dialog(get_local_string(30105), str(exc))
+        except InvalidPathError as exc:
+            # Bad or stale path (e.g. widget/favourite of a menu that no longer exists),
+            # use a notification instead of a modal dialog, widgets are refreshed continuously
+            from resources.lib.kodi.ui import show_notification
+            LOG.error('Invalid path requested: {}', exc)
+            show_notification(str(exc), time=8000)
         except Exception as exc:
             import traceback
             from resources.lib.kodi.ui import show_addon_error_info

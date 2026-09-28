@@ -1049,7 +1049,15 @@ msgctxt "#30413"
 msgid "By genre/subgenre ID"
 msgstr ""
 
-#. Unused 30414 to 30499
+msgctxt "#30414"
+msgid "By dubbed language"
+msgstr ""
+
+msgctxt "#30415"
+msgid "More like this"
+msgstr ""
+
+#. Unused 30416 to 30499
 
 msgctxt "#30500"
 msgid "Prefer the audio/subtitle language with country code (if available)"
@@ -1282,4 +1290,48 @@ msgstr ""
 
 msgctxt "#30749"
 msgid "Reset"
+msgstr ""
+
+msgctxt "#30750"
+msgid "Netflix home rows"
+msgstr ""
+
+msgctxt "#30751"
+msgid "The rows of the Netflix home page, as the website shows them"
+msgstr ""
+
+msgctxt "#30752"
+msgid "Love this"
+msgstr ""
+
+msgctxt "#30753"
+msgid "Remove love"
+msgstr ""
+
+msgctxt "#30754"
+msgid "You loved this"
+msgstr ""
+
+msgctxt "#30755"
+msgid "Profile lock"
+msgstr ""
+
+msgctxt "#30756"
+msgid "Enter a PIN of 4 digits"
+msgstr ""
+
+msgctxt "#30757"
+msgid "Remove the PIN that locks this profile?"
+msgstr ""
+
+msgctxt "#30758"
+msgid "The PIN must be 4 digits"
+msgstr ""
+
+msgctxt "#30759"
+msgid "The profile is now locked with a PIN"
+msgstr ""
+
+msgctxt "#30760"
+msgid "The profile lock has been removed"
 msgstr ""

@@ -23,3 +23,9 @@ disable=
 	too-many-positional-arguments,
     useless-object-inheritance,
     consider-using-from-import
+
+[DESIGN]
+# TODO: Update code so we can back to the lower defaults, for more readable code idealism.
+max-branches=20
+max-nested-blocks=10
+max-bool-expr = 10

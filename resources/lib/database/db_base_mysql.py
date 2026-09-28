@@ -8,6 +8,7 @@
     See LICENSES/MIT.md for more information.
 """
 from functools import wraps
+from typing import Iterable
 
 import mysql.connector
 
@@ -91,14 +92,18 @@ class MySQLDatabase(db_base.BaseDatabase):
         try:
             if cursor is None:
                 cursor = self.get_cursor()
-            query = query.replace("?", "%s")  # sqlite use '?' placeholder
+
+            # Standardize sqlite '?' placeholder to MySQL '%s'
+            query = query.replace("?", "%s")
+
             if params is not None:
-                results = cursor.execute(query, params, kwargs)
+                results = cursor.execute(query, params, **kwargs)
             else:
-                results = cursor.execute(query, kwargs)
-            if 'multi' in kwargs:
-                # 'multi' is lazy statement run sql only when needed
-                for result in results:  # pylint: disable=unused-variable
+                results = cursor.execute(query, **kwargs)
+
+            if kwargs.get('multi') and isinstance(results, Iterable):
+                # Consume the generator to ensure all multi-statements execute
+                for _ in results:
                     pass
         except mysql.connector.Error as exc:
             LOG.error('MySQL error {}:', exc)
