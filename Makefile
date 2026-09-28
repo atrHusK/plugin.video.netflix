@@ -2,11 +2,30 @@ export PYTHONPATH := .:$(CURDIR)/test
 PYTHON := python
 KODI_PYTHON_ABIS := 3.0.0 2.26.0
 
+# Check if tools are installed
+HAS_XMLLINT := $(shell command -v xmllint 2>/dev/null)
+HAS_GIT     := $(shell command -v git 2>/dev/null)
+
+# Fail immediately if xmllint is not installed
+ifndef HAS_XMLLINT
+  $(error 'xmllint' is required but not installed.)
+endif
+
+# Extract addon attributes
 name = $(shell xmllint --xpath 'string(/addon/@id)' addon.xml)
 version = $(shell xmllint --xpath 'string(/addon/@version)' addon.xml)
-git_branch = $(shell git rev-parse --abbrev-ref HEAD)
-git_hash = $(shell git rev-parse --short HEAD)
 matrix = $(findstring $(shell xmllint --xpath 'string(/addon/requires/import[@addon="xbmc.python"]/@version)' addon.xml), $(word 1,$(KODI_PYTHON_ABIS)))
+
+# Git fallbacks (allows building from source zips without git repo metadata)
+ifdef HAS_GIT
+	#git_branch = $(shell git rev-parse --abbrev-ref HEAD)
+	#git_hash = $(shell git rev-parse --short HEAD)
+  git_branch := $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null)
+  git_hash   := $(shell git rev-parse --short HEAD 2>/dev/null)
+else
+	git_branch := nogit
+	git_hash := local
+endif
 
 ifdef release
 	zip_name = $(name)-$(version).zip
