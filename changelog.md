@@ -1,4 +1,4 @@
-v2.0.6b
+v2.0.7
 - Rebased on @Lekma master which contains the following fixes compared to CastagnaIT/master since go-vegan patch 8
     - @go-vegan patch9 to 19:
         - year information
