@@ -7,18 +7,15 @@
     SPDX-License-Identifier: MIT
     See LICENSES/MIT.md for more information.
 """
+import os
+
 import xbmc
 import xbmcaddon
+import xbmcvfs
 
 from resources.lib.globals import G
 from resources.lib.utils.esn import WidevineForceSecLev
 from resources.lib.utils.logging import LOG
-
-
-def version_greater_than(version1, version2):
-    v1 = tuple(map(int, version1.split(".")))
-    v2 = tuple(map(int, version2.split(".")))
-    return v1 > v2
 
 
 def select_port(service):
@@ -160,17 +157,32 @@ def get_user_agent(enable_android_mediaflag_fix=False):
     if machine_arch.startswith('arm'):
         # Last number is the platform version of Chrome OS
         return base.replace('%PL%', '(X11; CrOS armv7l 15183.69.0)')
-    if machine_arch.startswith('aarch'):
-        addon = xbmcaddon.Addon("script.module.inputstreamhelper")
-        plugin_version = addon.getAddonInfo("version")
-        if version_greater_than(plugin_version, "0.8.5"):
-            return base.replace('%PL%', '(X11; Linux x86_64)')
-
+    if machine_arch.startswith('aarch') and not is_native_linux_widevine():
         # Last number is the platform version of Chrome OS
         return base.replace('%PL%', '(X11; CrOS aarch64 15183.69.0)')
-
     # x86 Linux
     return base.replace('%PL%', '(X11; Linux x86_64)')
+
+
+def is_native_linux_widevine() -> bool:
+    """
+    Check if the installed Widevine CDM is the native Linux build (from Google repository),
+    instead of the one extracted from a Chrome OS image.
+    InputStream Helper >= 0.8.6 installs the native build also on aarch64, Netflix refuses the playback
+    when the user agent (Chrome OS) does not match the CDM platform (Linux).
+    """
+    if not hasattr(is_native_linux_widevine, 'cached'):
+        try:
+            cdm_path = xbmcaddon.Addon('inputstream.adaptive').getSetting('DECRYPTERPATH') or 'special://home/cdm'
+        except RuntimeError:
+            cdm_path = 'special://home/cdm'
+        cdm_path = xbmcvfs.translatePath(cdm_path)
+        manifest_file = os.path.join(cdm_path, 'manifest.json')  # Native build (Google repository)
+        config_file = os.path.join(cdm_path, 'config.json')  # Chrome OS image build
+        # Removing the CDM leaves the config files, so the newest one tells which build is installed
+        is_native_linux_widevine.cached = os.path.exists(manifest_file) and (
+            not os.path.exists(config_file) or os.path.getmtime(manifest_file) >= os.path.getmtime(config_file))
+    return is_native_linux_widevine.cached
 
 
 def is_internet_connected():
